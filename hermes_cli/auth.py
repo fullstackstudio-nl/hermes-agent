@@ -479,7 +479,10 @@ def _nonempty_str(value: Any) -> bool:
 # ── Auth Store — persistence layer for ~/.hermes/auth.json ──────────────────────────────────────────
 
 def _auth_file_path() -> Path:
-    path = get_hermes_home() / "auth.json"
+    # An explicitly symlinked store shares one rotating OAuth grant. Resolve before
+    # deriving the lock or atomic-write target, otherwise refresh splits the link
+    # into an independent stale copy and concurrent profiles can reuse a grant.
+    path = (get_hermes_home() / "auth.json").resolve(strict=False)
     # Seat belt: under pytest, refuse to touch the real user's auth store (tests that forgot to
     # monkeypatch HERMES_HOME or escaped the hermetic conftest). In production: one dict lookup.
     if (os.environ.get("PYTEST_CURRENT_TEST")

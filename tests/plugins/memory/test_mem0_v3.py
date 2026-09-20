@@ -14,7 +14,7 @@ class FakeBackend:
     """Fake Mem0Backend for provider-level tests."""
 
     def __init__(self, search_results=None, all_results=None):
-        self._search_results = search_results or []
+        self._search_results = [{"user_id": "u123", "agent_id": "hermes", **r} for r in (search_results or [])]
         self._all_results = all_results or {"results": [], "count": 0}
         self.captured = []
 
@@ -33,6 +33,9 @@ class FakeBackend:
             {"user_id": user_id, "agent_id": agent_id, "infer": infer, "metadata": metadata},
         ))
         return {"status": "PENDING", "event_id": "evt-test-123"}
+
+    def get(self, memory_id):
+        return {"id": memory_id, "user_id": "u123", "agent_id": "hermes"}
 
     def update(self, memory_id, text):
         self.captured.append(("update", memory_id, text))
@@ -242,7 +245,7 @@ class TestMem0Prefetch:
         kind, query, opts = backend.captured[0]
         assert kind == "search"
         assert query == "what theme do I like?"
-        assert opts["filters"] == {"user_id": "u123"}
+        assert opts["filters"] == {"user_id": provider._user_id, "agent_id": provider._agent_id}
         assert opts["top_k"] == 10
         assert opts["rerank"] is False
         assert "## Mem0 Memory" in result

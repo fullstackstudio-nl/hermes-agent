@@ -99,7 +99,7 @@ def _load_config() -> dict:
     if user_id := get_secret("MEM0_USER_ID", ""):  # only when explicitly configured, so initialize() can fall back to the gateway-native id
         config["user_id"] = user_id
     file_cfg = read_json_or_empty(get_hermes_home() / "mem0.json")
-    config.update({k: v for k, v in file_cfg.items() if v is not None and v != ""})
+    config.update({k: v for k, v in file_cfg.items() if k == "search_agent_ids" or (v is not None and v != "")})
     # MEM0_API_KEY authenticates the Platform and self-hosted HTTP backends; pure OSS mode builds its
     # backend from the local ``oss`` config and has no platform credential to resolve, so a profile
     # scope WITHOUT the key must still load an OSS config (#99121 as it stands today: the caller is
@@ -142,6 +142,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._config = self._backend = self._sync_thread = self._prefetch_thread = None
         self._mode, self._api_key, self._host, self._user_id, self._agent_id = "platform", "", "", _DEFAULT_USER_ID, "hermes"
         self._rerank_default, self._channel = False, "cli"  # channel = gateway name (cli/telegram/discord/...)
+        self._search_agent_ids = frozenset()  # uninitialized providers cannot read memory
         self._sync_max_chars = _SYNC_MSG_MAX_CHARS
         self._prefetch_query = self._prefetch_result = ""
         self._prefetch_done = self._atexit_registered = False
@@ -248,37 +249,35 @@ class Mem0MemoryProvider(MemoryProvider):
         self._rerank_default = _rr.lower() in ("true", "1", "yes") if isinstance(_rr, str) else bool(_rr)
         self._channel = kwargs.get("platform") or "cli"
         self._sync_max_chars = int(cfg.get("sync_max_chars") or _SYNC_MSG_MAX_CHARS)
-        # Profile-scoped recall: which agent_ids this profile may see. Search is filtered on
-        # user_id only by the backend (mem0's search rejects a list/operator on agent_id — it
-        # runs entity-id validation before operator processing), so we over-fetch and post-filter
-        # on the agent_id field that every result carries. Absent key => own agent_id + the shared
-        # layer named by ``shared_agent_id``. Empty list ([]) => no filtering (see all agents
-        # under this user_id).
-        self._shared_agent_id = str(cfg.get("shared_agent_id") or _DEFAULT_SHARED_AGENT_ID)
-        sai = cfg.get("search_agent_ids")
-        if sai is None:
-            self._search_agent_ids = {self._agent_id, self._shared_agent_id}
-        elif isinstance(sai, list):
-            self._search_agent_ids = {str(x) for x in sai if x} or None
-        else:
-            self._search_agent_ids = {str(sai)} if sai else None
+        # Missing scope means own memories only; null/empty/malformed never means all.
+        self._backend = None
+        self._search_agent_ids = frozenset()
+        ids = cfg.get("search_agent_ids", [self._agent_id])
+        if (not isinstance(ids, list) or not ids or
+                any(not isinstance(x, str) or not x.strip() or x != x.strip() or x == "*" for x in ids) or
+                not isinstance(self._agent_id, str) or not self._agent_id.strip() or
+                self._agent_id not in ids or not isinstance(self._user_id, str) or not self._user_id.strip()):
+            raise ValueError("Mem0 search_agent_ids must be a nonempty list of exact IDs including agent_id")
+        self._search_agent_ids = frozenset(ids)
         self._backend = self._create_backend()
         if self._backend and not self._atexit_registered:
             atexit.register(self._shutdown_backend)
             self._atexit_registered = True
 
     def _search(self, query: str, top_k: int = 10, rerank: bool = False, backend=None) -> list:
-        # Scoped to user_id at the backend; agent_id post-filtering (self._search_agent_ids) keeps
-        # recall inside this profile's allowed agents + the configured shared layer, while writes
-        # still attach this profile's own agent_id. We over-fetch (×3, min 30) because filtering shrinks
-        # the effective result set, then trim back to top_k. No allow-set => legacy user_id-only recall.
-        allow = self._search_agent_ids
-        fetch = top_k if not allow else max(top_k * 3, 30)
-        results = (backend or self._backend).search(query, filters={"user_id": self._user_id}, top_k=fetch, rerank=rerank)
-        if not allow:
-            return results
-        filtered = [r for r in results if r.get("agent_id") in allow]
-        return filtered[:top_k]
+        # Scalar queries work with Mem0 V3 validation; fetch per scope avoids a
+        # noisy foreign profile crowding all allowed results out of a postfilter.
+        results = {}
+        for agent_id in sorted(self._search_agent_ids):
+            rows = (backend or self._backend).search(
+                query, filters={"user_id": self._user_id, "agent_id": agent_id},
+                top_k=top_k, rerank=rerank,
+            )
+            for row in rows:
+                if (isinstance(row, dict) and row.get("user_id") == self._user_id
+                        and row.get("agent_id") == agent_id and row.get("id")):
+                    results[row["id"]] = row
+        return sorted(results.values(), key=lambda r: float(r.get("score") or 0), reverse=True)[:top_k]
 
     def _add(self, messages: list, infer: bool):
         metadata = {"channel": self._channel} if self._channel else {}
@@ -379,11 +378,22 @@ class Mem0MemoryProvider(MemoryProvider):
         msg = "Fact stored." if (self._mode == "oss" or self._host) else "Fact queued for storage."
         return json.dumps({"result": msg, "event_id": event_id})
 
+    def _tool_mutate(self, args: dict, *, delete: bool = False) -> str:
+        # Search grants read access to shared facts, never write access. Check the
+        # current stored payload, not a prior search result supplied by the model.
+        row = self._backend.get(args["memory_id"])
+        if (not isinstance(row, dict) or row.get("user_id") != self._user_id
+                or row.get("agent_id") != self._agent_id):
+            return tool_error("Memory not found or not owned by this profile")
+        result = (self._backend.delete(args["memory_id"]) if delete else
+                  self._backend.update(args["memory_id"], args["text"]))
+        return json.dumps(result)
+
     _TOOL_HANDLERS = {
         "mem0_search": (("query",), "Search failed", _tool_search, "skip"),
         "mem0_add": (("content",), "Failed to store", _tool_add, "count"),
-        "mem0_update": (("memory_id", "text"), "Update failed", lambda self, a: json.dumps(self._backend.update(a["memory_id"], a["text"])), "not_found"),
-        "mem0_delete": (("memory_id",), "Delete failed", lambda self, a: json.dumps(self._backend.delete(a["memory_id"])), "not_found"),
+        "mem0_update": (("memory_id", "text"), "Update failed", lambda self, a: self._tool_mutate(a), "not_found"),
+        "mem0_delete": (("memory_id",), "Delete failed", lambda self, a: self._tool_mutate(a, delete=True), "not_found"),
     }
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:

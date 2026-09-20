@@ -29,6 +29,9 @@ class Mem0Backend(ABC):
     @abstractmethod
     def _delete(self, memory_id: str) -> None: ...
 
+    def get(self, memory_id: str) -> dict | None:
+        raise NotImplementedError("Backend does not support memory ownership checks")
+
     def update(self, memory_id: str, text: str) -> dict:
         self._update(memory_id, text)
         return {"result": "Memory updated.", "memory_id": memory_id}
@@ -53,6 +56,9 @@ class PlatformBackend(Mem0Backend):
 
     def add(self, messages: list, *, user_id: str, agent_id: str, infer: bool = False, metadata: dict | None = None) -> dict:
         return self._client.add(messages, **_add_kwargs(user_id, agent_id, infer, metadata))
+
+    def get(self, memory_id: str) -> dict | None:
+        return self._client.get(memory_id=memory_id)
 
     def _update(self, memory_id: str, text: str) -> None:
         self._client.update(memory_id=memory_id, text=text)
@@ -83,6 +89,9 @@ class SelfHostedBackend(Mem0Backend):
 
     def add(self, messages: list, *, user_id: str, agent_id: str, infer: bool = False, metadata: dict | None = None) -> dict:
         return self._json("POST", "/memories", json={"messages": messages, **_add_kwargs(user_id, agent_id, infer, metadata)})
+
+    def get(self, memory_id: str) -> dict | None:
+        return self._json("GET", f"/memories/{memory_id}")
 
     def _update(self, memory_id: str, text: str) -> None:
         self._json("PUT", f"/memories/{memory_id}", json={"text": text})
@@ -116,6 +125,7 @@ class OSSBackend(Mem0Backend):
 
     def __init__(self, oss_config: dict):
         import os
+        from hermes_constants import get_hermes_home
         from mem0 import Memory
         from ._oss_providers import EMBEDDER_PROVIDERS, KNOWN_DIMS, LLM_PROVIDERS
 
@@ -140,7 +150,9 @@ class OSSBackend(Mem0Backend):
             vs_config["embedding_model_dims"] = dims
             self._recreate_collection_if_dims_changed(vector_store.get("provider", "qdrant"), vs_config, dims)
         vector_store["config"] = vs_config
-        config = {"vector_store": vector_store, "llm": _provider_block("llm", LLM_PROVIDERS), "embedder": _provider_block("embedder", EMBEDDER_PROVIDERS), "version": "v1.1"}
+        history_dir = get_hermes_home() / "mem0"
+        history_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        config = {"history_db_path": str(history_dir / "history.db"), "vector_store": vector_store, "llm": _provider_block("llm", LLM_PROVIDERS), "embedder": _provider_block("embedder", EMBEDDER_PROVIDERS), "version": "v1.1"}
         if str(config["llm"].get("provider") or "").strip().lower() == "openai":
             # mem0 validates LlmConfig.provider before its factory lookup: build the supported OpenAI config, then swap the provider.
             _register_direct_openai_provider()
@@ -156,8 +168,9 @@ class OSSBackend(Mem0Backend):
 
     @staticmethod
     def _recreate_collection_if_dims_changed(provider: str, vs_config: dict, expected_dims: int) -> None:
-        """Delete stale vector collection when embedding dimensions change."""
+        """Refuse incompatible embeddings; data migration is an explicit operator task."""
         collection_name = vs_config.get("collection_name", "mem0")
+        current_dims = None
         with suppress(Exception):
             if provider == "qdrant":
                 from qdrant_client import QdrantClient
@@ -176,25 +189,31 @@ class OSSBackend(Mem0Backend):
                     if isinstance(vectors, dict):
                         vectors = next(iter(vectors.values()), None)
                     current_dims = getattr(vectors, "size", None)
-                    if current_dims is not None and current_dims != expected_dims:
-                        client.delete_collection(collection_name)
+
             elif provider == "pgvector":
                 import psycopg2
-                from psycopg2 import sql as pgsql
                 conn_params = {k: vs_config[k] for k in ("host", "port", "user", "password", "dbname", "sslmode") if vs_config.get(k)}
                 with closing(psycopg2.connect(**conn_params)) as conn:
                     conn.autocommit = True
                     with closing(conn.cursor()) as cur:
                         cur.execute("SELECT atttypmod FROM pg_attribute WHERE attrelid = %s::regclass AND attname = 'vector'", (collection_name,))
                         row = cur.fetchone()
-                        if row and row[0] > 0 and row[0] != expected_dims:
-                            cur.execute(pgsql.SQL("DROP TABLE IF EXISTS {}").format(pgsql.Identifier(collection_name)))
+                        current_dims = row[0] if row and row[0] > 0 else None
+        if current_dims is not None and current_dims != expected_dims:
+            raise ValueError(
+                f"Mem0 collection {collection_name} has {current_dims} dimensions, "
+                f"configured embedder requires {expected_dims}; refusing destructive recreation. "
+                "Restore the embedding configuration or explicitly migrate to a new collection."
+            )
 
     def search(self, query: str, *, filters: dict, top_k: int = 10, rerank: bool = False) -> list[dict]:
         return _unwrap_results(self._memory.search(query, filters=filters, top_k=top_k))
 
     def add(self, messages: list, *, user_id: str, agent_id: str, infer: bool = False, metadata: dict | None = None) -> dict:
         return self._memory.add(messages, **_add_kwargs(user_id, agent_id, infer, metadata))
+
+    def get(self, memory_id: str) -> dict | None:
+        return self._memory.get(memory_id)
 
     def _update(self, memory_id: str, text: str) -> None:
         self._memory.update(memory_id, data=text)
