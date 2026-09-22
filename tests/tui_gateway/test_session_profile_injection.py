@@ -110,12 +110,12 @@ def test_the_bound_profile_selects_the_profile_scoped_container_key(monkeypatch,
     is keyed on the bound profile, so an unbound one let a served profile's turn
     reuse the launch profile's container.
 
-    ``terminal_scope(None)`` is the precondition, not decoration: with a policy
+    Pinning an empty policy scope is the precondition, not decoration: with a policy
     scope bound, ``_tenv`` reads ONLY that policy and the ``TERMINAL_*`` env this
     test sets would be ignored (tests share one thread context, so a scope an
     earlier test left behind would otherwise decide the backend here)."""
     import tools.terminal_tool as tt
-    from tools.terminal_scope import terminal_scope
+    from tools.terminal_scope import reset_terminal_scope, set_terminal_scope
 
     monkeypatch.setattr(server, "_current_profile_name", lambda: "launch-profile")
     monkeypatch.setattr(tt, "_ensure_terminal_env_bridged", lambda: None)
@@ -128,9 +128,10 @@ def test_the_bound_profile_selects_the_profile_scoped_container_key(monkeypatch,
     )
 
     tokens = server._set_session_context("skey-docker")
+    scope_token = set_terminal_scope(None)
     try:
-        with terminal_scope(None):
-            assert tt._current_session_profile() == "team-two"
-            assert tt._resolve_container_task_id(None) == "profile:team-two"
+        assert tt._current_session_profile() == "team-two"
+        assert tt._resolve_container_task_id(None) == "profile:team-two"
     finally:
+        reset_terminal_scope(scope_token)
         server._clear_session_context(tokens)
