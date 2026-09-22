@@ -55,6 +55,9 @@ def _compute_host_turn_frame(
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
         attached_images = list(image_paths if image_paths is not None else session.get("attached_images", []))
+    # The host pipe names no login of its own, so the gateway ships the record's login and the display
+    # name stamped with it as one pair; a peer that predates the name field simply sends none.
+    auth_user_id, auth_user_name = _session_auth_user(session)
     return {
         "type": "turn.start", "sid": sid, "request_id": rid,
         "session_key": session.get("session_key") or sid, "text": text,
@@ -68,7 +71,7 @@ def _compute_host_turn_frame(
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session), "attached_images": attached_images,
-        "auth_user_id": _session_auth_user_id(session),
+        "auth_user_id": auth_user_id, "auth_user_name": auth_user_name,
         "queued_prompt_generation": queued_prompt_generation,
         # #101416: vouch that this process already holds the registry lease for this session, so
         # the child adopts it as an inert token instead of re-claiming and being fenced out by

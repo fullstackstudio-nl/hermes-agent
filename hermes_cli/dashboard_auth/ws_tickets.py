@@ -33,11 +33,18 @@ class TicketInvalid(Exception):
     """Ticket missing, expired, or already consumed."""
 
 
-def mint_ticket(*, user_id: str, provider: str) -> str:
+def mint_ticket(*, user_id: str, provider: str, user_name: str = "") -> str:
     """One-shot base64url ticket (32 random bytes) bound to this identity; ``consume_ticket``
-    hands the ``info`` dict back to the WS handler."""
+    hands the ``info`` dict back to the WS handler.
+
+    ``user_name`` is the provider-verified display name of THIS ``user_id``, taken from the very
+    :class:`~hermes_cli.dashboard_auth.base.Session` that authorizes the mint, so the WS session can
+    label the person without a second token verification later. It travels as one pair with the
+    login and is ``""`` when the provider minted no name (then only the login id exists).
+    """
     ticket = secrets.token_urlsafe(32)
-    info = {"user_id": user_id, "provider": provider, "minted_at": int(time.time())}
+    info = {"user_id": user_id, "provider": provider, "user_name": user_name,
+            "minted_at": int(time.time())}
     with _lock:
         _tickets[ticket] = (int(time.time()) + TTL_SECONDS, info)
         _gc_expired_locked()

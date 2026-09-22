@@ -364,7 +364,7 @@ def _(rid, params: dict) -> dict:
             "running": False, "session_key": key, "show_reasoning": _load_show_reasoning(), "source": source,
             "slash_worker": None, "tool_progress_mode": _load_tool_progress_mode(), "tool_started_at": {},
             "transport": current_transport() or _stdio_transport,
-            "auth_user_id": _transport_auth_user_id(current_transport())}
+            **_transport_auth_record_fields(current_transport())}
         _register_session_cwd(_sessions[sid])
     # No DB row here (drafts left "Untitled" litter): created on the first prompt — except seeded sessions.
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop launch (and every "New agent" /
@@ -1984,7 +1984,7 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
     """Build + register the branched agent in the parent's profile; the DEDICATED db handle is ours until
     ``_transfer_db_to_agent`` (released here on failure)."""
     parent_home = session.get("profile_home")
-    parent_user_id = _session_auth_user_id(session)
+    parent_user_id, parent_user_name = _session_auth_user(session)
     branch_db, branch_owns_db = _profile_session_db(parent_home) if parent_home else (None, False)
     try:
         with _profile_build_scope(parent_home):
@@ -1999,7 +1999,9 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
             branch_owns_db = False
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = None  # claimed lazily on the first turn
-            _sessions[new_sid]["auth_user_id"] = parent_user_id
+            # The branch inherits the parent's login AND its name together — stamping only the id would
+            # leave the name _init_session took from the current transport labelling the wrong login.
+            _sessions[new_sid].update(auth_user_id=parent_user_id, auth_user_name=parent_user_name)
         return agent
     finally:
         if branch_owns_db and branch_db is not None:

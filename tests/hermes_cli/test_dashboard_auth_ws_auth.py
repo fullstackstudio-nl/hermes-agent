@@ -474,3 +474,34 @@ class TestGatewayWsUrl:
         sc_cred = sc.split("internal=")[1].split("&")[0]
         assert gw_cred == sc_cred
 
+
+
+class TestWsIdentityCarriesTheDisplayName:
+    """The WS credential is the only vehicle that can hand the provider's display
+    name to a turn: the ticket is minted on an authenticated request that holds a
+    verified Session (user_id, provider AND display_name), while the turn itself
+    has no token to verify. The name travels as one pair with the login, and a
+    credential without one stamps exactly the two fields it always did."""
+
+    def test_a_minted_display_name_reaches_the_stamped_identity(self, gated_app):
+        ticket = mint_ticket(user_id="u1", provider="stub", user_name="Robin de Vries")
+        ws = _fake_ws(query={"ticket": ticket}, path="/api/ws")
+
+        assert _web_server_chat._ws_auth_ok(ws) is True
+        assert ws._hermes_auth_identity == {
+            "user_id": "u1", "provider": "stub", "user_name": "Robin de Vries"}
+
+    def test_no_display_name_leaves_the_identity_exactly_as_before(self, gated_app):
+        ws = _fake_ws(query={"ticket": mint_ticket(user_id="u1", provider="stub")}, path="/api/ws")
+
+        assert _web_server_chat._ws_auth_ok(ws) is True
+        assert ws._hermes_auth_identity == {"user_id": "u1", "provider": "stub"}
+
+    def test_the_internal_credential_names_no_person(self, gated_app):
+        """The PTY child's server-internal credential is not a login; it must not
+        acquire a display name either."""
+        ws = _fake_ws(query={"internal": internal_ws_credential()}, path="/api/ws")
+
+        assert _web_server_chat._ws_auth_ok(ws) is True
+        assert ws._hermes_auth_identity == {
+            "user_id": "server-internal", "provider": "server-internal"}

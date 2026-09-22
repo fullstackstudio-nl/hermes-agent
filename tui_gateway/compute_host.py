@@ -376,8 +376,10 @@ class ComputeHost:
                 "transport": self._transport}
         session = server._sessions[sid]
         session["transport"] = self._transport
-        # The host pipe names no login; the record carries the one the gateway stamped at creation.
+        # The host pipe names no login; the record carries the one the gateway stamped at creation, and
+        # its display name is stamped in the same step so the pair cannot come apart here.
         session["auth_user_id"] = frame.get("auth_user_id")
+        session["auth_user_name"] = str(frame.get("auth_user_name") or "")
         session["profile_home"] = profile_home or session.get("profile_home")
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")

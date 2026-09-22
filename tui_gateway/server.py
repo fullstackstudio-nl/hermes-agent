@@ -1280,10 +1280,13 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             # runtime user_id, so a tool attributing work to a user (kanban, send_message, cron job args,
             # background-watcher fields) names the person the agent itself was built for. An ungated
             # gateway (and the PTY child's server-internal credential) names no login: both stay "".
-            user_id = _session_auth_user_id(sess) or ""
-            # The minted WS identity is only {user_id, provider} — no email or display name exists to bind,
-            # so the provider-scoped login id is the one human-facing label available.
-            user_name = user_id.split(":", 1)[1] if user_id else ""
+            user_id, display_name = _session_auth_user(sess)
+            user_id = user_id or ""
+            # The person's own name when the login carried one (the OIDC ``name`` claim, verified with the
+            # login itself and minted into the WS credential beside it) — never a lookup on this path, and
+            # never a name from another identity. Without one, the provider-scoped login id is still the
+            # only human-facing label available.
+            user_name = display_name or (user_id.split(":", 1)[1] if user_id else "")
             identity = getattr(sess.get("transport"), "auth_identity", None)
             if _methods_browser_control._is_authenticated_identity(identity):
                 browser_control_principal = _methods_browser_control._principal_digest(identity)
@@ -2362,24 +2365,45 @@ def _startup_system_prompt(cfg: dict, task_id: str) -> str:
     return system_prompt
 
 
-def _transport_auth_user_id(transport) -> str | None:
-    """``<provider>:<user id>`` the WS-upgrade credential authenticated for ``transport``, or None for the legacy
-    token, stdio and the PTY child's server-internal credential. The prefix keeps a basic-auth ``alice`` and an
-    OIDC ``alice`` apart."""
+def _transport_auth_user(transport) -> tuple[str | None, str]:
+    """``(<provider>:<user id>, display name)`` the WS-upgrade credential authenticated for ``transport``: ONE
+    pair out of ONE minted identity, so a name can never end up labelling a different login. ``(None, "")`` for
+    the legacy token, stdio and the PTY child's server-internal credential. The prefix keeps a basic-auth
+    ``alice`` and an OIDC ``alice`` apart; the name is "" unless the credential carried one."""
     identity = getattr(transport, "auth_identity", None)
-    if _methods_browser_control._is_authenticated_identity(identity):
-        return f"{str(identity['provider']).strip()}:{str(identity['user_id']).strip()}"
-    return None
+    if not _methods_browser_control._is_authenticated_identity(identity):
+        return None, ""
+    user_id = f"{str(identity['provider']).strip()}:{str(identity['user_id']).strip()}"
+    return user_id, str(identity.get("user_name") or "").strip()
+
+
+def _transport_auth_user_id(transport) -> str | None:
+    """The login half of :func:`_transport_auth_user` — for callers that attribute but never label."""
+    return _transport_auth_user(transport)[0]
+
+
+def _transport_auth_record_fields(transport) -> dict:
+    """The identity fields a session record is stamped with at creation. Always written as this ONE pair (never
+    field by field), so no record can hold a display name belonging to another login."""
+    user_id, user_name = _transport_auth_user(transport)
+    return {"auth_user_id": user_id, "auth_user_name": user_name}
+
+
+def _session_auth_user(session: dict | None) -> tuple[str | None, str]:
+    """``(login, display name)`` ``session`` was created under, stamped on the record as ``auth_user_id`` /
+    ``auth_user_name``. A second window turns the transport slot into a FanoutTransport, which names no login,
+    so only a record without the slot reads its transport. The stamped name is read only from a record that
+    also names the login it was stamped with, and a record that carries the login alone yields no name."""
+    session = session or {}
+    if "auth_user_id" in session:
+        user_id = session["auth_user_id"]
+        return user_id, (str(session.get("auth_user_name") or "").strip() if user_id else "")
+    return _transport_auth_user(session.get("transport"))
 
 
 def _session_auth_user_id(session: dict | None) -> str | None:
-    """The login ``session`` was created under, stamped on the record as ``auth_user_id``. A second window turns
-    the transport slot into a FanoutTransport, which names no login, so only a record without the slot reads
-    its transport."""
-    session = session or {}
-    if "auth_user_id" in session:
-        return session["auth_user_id"]
-    return _transport_auth_user_id(session.get("transport"))
+    """The login half of :func:`_session_auth_user` — the value ``_make_agent`` builds the agent with."""
+    return _session_auth_user(session)[0]
 
 
 def _make_agent(
@@ -2495,7 +2519,7 @@ def _init_session(
             "model_override": None,
             # Async events go to the transport that created the session (stdio for Ink, WS for the dashboard).
             "transport": current_transport() or _stdio_transport,
-            "auth_user_id": _transport_auth_user_id(current_transport()),
+            **_transport_auth_record_fields(current_transport()),
         }
         _session_todo_state(_sessions[sid])
     _hydrate_session_cwd(sid, key, session_db, profile_home)
@@ -2560,7 +2584,7 @@ def _deferred_session_record(
         "slash_worker": None, "source": source, "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {}, "todo_state": todo_state,
         "transport": current_transport() or _stdio_transport,
-        "auth_user_id": _transport_auth_user_id(current_transport()),
+        **_transport_auth_record_fields(current_transport()),
     }
 
 
