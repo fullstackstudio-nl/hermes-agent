@@ -18,9 +18,32 @@ Both memory and delivery fixes below were running as hand-applied patches on a l
 | `fix(tui_gateway): bind the signed-in user into the dashboard session context` | The gateway passes the session's authenticated user into `set_session_vars`, so `HERMES_SESSION_USER_ID`, `_ID_ALT` and `_USER_NAME` are filled instead of empty. | Without it a bot cannot say who it is talking to: the model reads those variables, finds them empty, and treats the person as unidentified. Every consumer benefits, not only our plugin. | Yes — it is offered upstream as pull request #118439. Drop this commit if that is merged. |
 | `feat(tui_gateway): name the signed-in user instead of printing their login id` | The WS ticket carries the provider's verified `display_name` beside the login it belongs to, and the gateway binds it as `HERMES_SESSION_USER_NAME`. A credential without a name keeps today's fallback, the bare login id. | The commit above only had the login id to bind, and on an OIDC deployment that is an opaque uuid — a bot could name the account but not the person. The name exists only on the request that mints the ticket: the turn holds no token, and calling the provider from a turn would put a network round trip on the hot path. | Only if upstream widens the minted WS identity to carry a name. Offer it upstream together with #118439; it builds on that commit, so the two are dropped together. |
 | `test(tui_gateway): guard the session profile binding on the dashboard route` | A test that `_set_session_context` binds `HERMES_SESSION_PROFILE` from the record's own `profile_home`, and that the persistent-Docker container key follows it. No production change: this base already passes `profile=`. | It was unbound on our older base, and nothing fails loudly when it is: a cleared contextvar is authoritative, so readers silently fall back to the process's own profile and every dashboard session shares one sandbox. The API-server route has such a guard upstream; this route did not. | Yes, as soon as upstream has its own test for this route. Offer it upstream — it guards upstream's own behaviour, not ours. |
-| `fix(memory): keep mem0 recall inside the profile's own agents` | mem0 recall is filtered on `agent_id` as well as `user_id`, with a shared layer and a `search_agent_ids` setting. | Without it every profile under one principal recalls every other profile's memories. A gateway with a profile per department, or per customer, leaks between them. | Offer it upstream; the leak is not ours. |
-| `refactor(memory): make the shared memory layer's name a setting` | The shared layer defaults to `shared` and is named by `MEM0_SHARED_AGENT_ID` (a profile's own `.env`) or `shared_agent_id` in that profile's `mem0.json`. | The former default was a company name in code other people run, and one fixed name cannot serve a host that wants one house layer, one layer per customer and one per department. Read through the profile secret scope like `MEM0_AGENT_ID`, so under multiplexing a profile's layer name comes from its own `.env`, never the launch profile's. | Only with the commit above; the two are one feature. |
+| `Isolate team memory and preserve shared OAuth rotation` (carried, `4a01402f`) | mem0 recall is scoped per profile: one query per allowed `agent_id` instead of one wide query, and every row is re-checked against the scope it came back from. `mem0_update` and `mem0_delete` check the stored row's owner, the OSS history database moves into the profile's own home (0700), an embedding-dimension mismatch raises instead of deleting the collection, and `auth.json` is resolved before the lock and the atomic write. | The same leak our own smaller fix closed, plus the two halves it left open. Read access to a shared layer used to confer update and delete, because the tools trusted a `memory_id` the model had seen in a search result. Profiles also shared one mem0 history database, and a changed embedder silently dropped the whole collection. The auth half is what keeps one shared OAuth grant rotating: without resolving the link first, a refresh replaced the symlink with an independent stale copy and the lock no longer covered the profiles that share it. | Offer it upstream; none of it is fork-specific. The auth half stands alone and can go separately. |
+| `Scope dashboard memory status and selection to profile` (carried, `850313fc`) | `GET /api/memory` and `PUT /api/memory/provider` take a `profile` and run inside that profile's scope instead of the launch profile's. | Without it the dashboard reports the launch profile's memory provider whatever profile is being looked at, and activating a provider writes to the wrong profile's config. | On this base only the regression test is left: upstream added the `profile` argument and `config_scoped_to_thread` itself, so the carried production change was already in place and we kept upstream's. Drop the test once upstream has its own for this route. |
+| `Fix vulnerable dashboard dependencies` (carried, `75a3302c`) | `colord` and `sanitize-html` are pinned in `overrides` and raised in the lockfile (`2.9.3` to `2.10.0`, `2.17.6` to `2.17.7`). No package is added or removed and nothing else changes version. | Both were flagged against the dashboard's dependency tree. The `overrides` pins matter more than the lockfile bump: they stop a transitive dependency pulling a vulnerable version back in on the next resolve. | Yes, as soon as upstream's own lockfile carries both at or above these versions. |
+| `fix(memory): keep the shared layer a setting on the carried isolation` | The default recall scope is the profile's own agent plus the layer named by `shared_agent_id` (`MEM0_SHARED_AGENT_ID`, or `shared_agent_id` in `mem0.json`, default `shared`). The name is validated like any other entry in the scope. | The carried isolation defaults the scope to the profile's own agent alone, so a shared layer only exists where a profile spells it out in `search_agent_ids`. A gateway with a profile per customer or per department still needs one layer everyone may read, and a deployment that already holds memories under such a layer would lose recall of them the moment the default narrowed — silently, because nothing is renamed or migrated in the store. | Only together with the carried isolation above; it has no meaning without it. |
 | `fix(bots): retry a delivery that failed because the target was busy` | `target_busy` becomes a constant, joins `ALL_REASONS` and is auto retryable. | A delivery that fails because the receiver is mid-turn is temporary. Without it such a message is dropped silently; raising `turn_wait_seconds` does not help, because deliveries serialise on the receiver's chat. | Yes, it is a plain bug fix. Offer it upstream. |
+
+## Commits carried from another deployment
+
+Three commits below were written on another deployment of this fork. They keep their original
+subject and author date, and each one says in its own message that it was carried and which commit it
+came from there. The author field is ours: the identity on those commits was a tool's, and no
+assistant or tool name belongs anywhere in a repository we publish — so the credit is recorded in
+words instead of in metadata. The table lists them by that subject and short sha, so a later rebase
+can tell them from ours. Two of them needed a decision on the way in:
+
+- Their memory isolation replaces the smaller fix we wrote for the same leak, so ours is not stacked
+  on top of it. Our two earlier memory commits stay in history — `fix(memory): keep mem0 recall inside
+  the profile's own agents` also introduces the `TARGET_BUSY` constant that the delivery fix depends
+  on, so it must not be reverted — but their code, not ours, is what runs.
+- Two behaviours of our own version are deliberately gone. `search_agent_ids: []` used to mean "recall
+  every agent under this `user_id`" and now fails the profile closed instead, and a bare string is no
+  longer accepted in place of a list. An empty or malformed scope is a configuration mistake, and the
+  safe reading of a mistake is no recall rather than everyone's.
+- Their tests assumed their own scope configuration and a default scope of one agent. The fixtures were
+  adapted, and the two assertions that counted a recall as exactly one backend query now count one per
+  allowed agent, which is what the carried recall does.
 
 ## Deploying the shared-memory-layer rename
 
@@ -42,7 +65,12 @@ scope is built from that profile's own files and `MEM0_SHARED_AGENT_ID` is not o
 allowlist in `agent/secret_scope.py`, so once the host multiplexes only the launch profile still
 resolves the service environment and every other profile would read nothing. `"shared_agent_id"` in
 that profile's `mem0.json` does the same and wins over the `.env` value. A profile that sets
-`search_agent_ids` explicitly ignores this setting — list the layer in that array instead.
+`search_agent_ids` explicitly ignores this setting — list the layer in that array instead. That list
+must always contain the profile's own `agent_id`. An empty list, a missing `agent_id`, a padded name
+or `*` is refused outright and leaves the profile no recall at all; it no longer means "everything".
+
+Recall costs one backend query per name in the scope, so the default is two: the profile's own agent
+and its shared layer.
 
 The value is read when the agent is built, so restart the gateway (or open a new session) after
 adding the line.
