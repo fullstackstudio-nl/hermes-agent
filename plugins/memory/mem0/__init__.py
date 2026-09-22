@@ -33,6 +33,14 @@ _CLIENT_ERROR_TYPES = ("MemoryNotFoundError", "ValidationError")
 # so legacy mem0.json files written by the wizard don't override gateway-native ids.
 _DEFAULT_USER_ID = "hermes-user"
 
+# Name of the memory layer every profile may recall from besides its own. It is only ever READ:
+# writes always attach the writing profile's own agent_id, so a layer is populated by running
+# something with MEM0_AGENT_ID set to this name. Deployments name their own layer with
+# MEM0_SHARED_AGENT_ID (per-profile .env) or "shared_agent_id" in mem0.json — a shared house layer,
+# one layer per customer, one per department. A profile that lists "search_agent_ids" explicitly
+# says exactly what it may see and this name is not added to it.
+_DEFAULT_SHARED_AGENT_ID = "shared"
+
 # sync_turn sends the whole turn to the backend for fact extraction. OSS embedding
 # models often have small context windows (bge-small-zh-v1.5: 512 tokens ≈ 500 chars;
 # jina-embeddings-v3: 8192), and oversized turns make backend.add() raise — Ollama
@@ -83,7 +91,11 @@ def _load_config() -> dict:
     # A scope-less multiplex caller raises here on purpose — that is a spawn-site bug, and
     # swallowing it would silently route the turn's memories to the default profile.
     config = {"mode": get_secret("MEM0_MODE", "") or "platform", "host": get_secret("MEM0_HOST", "") or "",
-              "agent_id": get_secret("MEM0_AGENT_ID", "") or "hermes", "oss": {}}
+              "agent_id": get_secret("MEM0_AGENT_ID", "") or "hermes",
+              # Read through the profile scope like agent_id: under multiplexing the name of a
+              # profile's shared layer lives in that profile's own .env, not the process env.
+              "shared_agent_id": get_secret("MEM0_SHARED_AGENT_ID", "") or _DEFAULT_SHARED_AGENT_ID,
+              "oss": {}}
     if user_id := get_secret("MEM0_USER_ID", ""):  # only when explicitly configured, so initialize() can fall back to the gateway-native id
         config["user_id"] = user_id
     file_cfg = read_json_or_empty(get_hermes_home() / "mem0.json")
@@ -239,11 +251,13 @@ class Mem0MemoryProvider(MemoryProvider):
         # Profile-scoped recall: which agent_ids this profile may see. Search is filtered on
         # user_id only by the backend (mem0's search rejects a list/operator on agent_id — it
         # runs entity-id validation before operator processing), so we over-fetch and post-filter
-        # on the agent_id field that every result carries. Absent key => own agent_id + fss-shared
-        # shared layer. Empty list ([]) => no filtering (see all agents under this user_id).
+        # on the agent_id field that every result carries. Absent key => own agent_id + the shared
+        # layer named by ``shared_agent_id``. Empty list ([]) => no filtering (see all agents
+        # under this user_id).
+        self._shared_agent_id = str(cfg.get("shared_agent_id") or _DEFAULT_SHARED_AGENT_ID)
         sai = cfg.get("search_agent_ids")
         if sai is None:
-            self._search_agent_ids = {self._agent_id, "fss-shared"}
+            self._search_agent_ids = {self._agent_id, self._shared_agent_id}
         elif isinstance(sai, list):
             self._search_agent_ids = {str(x) for x in sai if x} or None
         else:
@@ -255,8 +269,8 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def _search(self, query: str, top_k: int = 10, rerank: bool = False, backend=None) -> list:
         # Scoped to user_id at the backend; agent_id post-filtering (self._search_agent_ids) keeps
-        # recall inside this profile's allowed agents + the fss-shared layer, while writes still
-        # attach this profile's own agent_id. We over-fetch (×3, min 30) because filtering shrinks
+        # recall inside this profile's allowed agents + the configured shared layer, while writes
+        # still attach this profile's own agent_id. We over-fetch (×3, min 30) because filtering shrinks
         # the effective result set, then trim back to top_k. No allow-set => legacy user_id-only recall.
         allow = self._search_agent_ids
         fetch = top_k if not allow else max(top_k * 3, 30)
