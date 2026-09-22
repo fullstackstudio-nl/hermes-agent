@@ -75,8 +75,12 @@ def test_profile_reads_writes_prefetch_and_sync_stay_scoped_a_b_a(tmp_path, monk
                 body = p.prefetch("knowledge")
                 assert f"{agent} knowledge" in body and "shared knowledge" in body
                 assert "foreign" not in body and "other user" not in body
-                # Even known UUIDs do not confer write access to another tenant.
+                # Even known UUIDs do not confer write access to another tenant. The shared layer is
+                # the one deliberate exception -- a profile that may store there may also correct and
+                # remove what is in it -- so it is excluded here and covered in the shared-layer tests.
                 for row in list(backend.rows.values()):
+                    if row["agent_id"] == "shared" and row["user_id"] == "human":
+                        continue
                     if row["agent_id"] != agent or row["user_id"] != "human":
                         before = row.copy()
                         for name in ["mem0_update", "mem0_delete"]:

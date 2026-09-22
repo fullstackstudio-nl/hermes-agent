@@ -33,9 +33,10 @@ _CLIENT_ERROR_TYPES = ("MemoryNotFoundError", "ValidationError")
 # so legacy mem0.json files written by the wizard don't override gateway-native ids.
 _DEFAULT_USER_ID = "hermes-user"
 
-# Name of the memory layer every profile may recall from besides its own. It is only ever READ:
-# writes always attach the writing profile's own agent_id, so a layer is populated by running
-# something with MEM0_AGENT_ID set to this name. Deployments name their own layer with
+# Name of the memory layer every profile may recall from besides its own. A turn reaches it in two
+# ways and no more: recall reads it, and ``mem0_add`` writes to it when the call explicitly asks to
+# share (see ``_shared_write_target``). An automatic turn sync never does, so nothing lands there as
+# a side effect of a conversation. Deployments name their own layer with
 # MEM0_SHARED_AGENT_ID (per-profile .env) or "shared_agent_id" in mem0.json — a shared house layer,
 # one layer per customer, one per department. A profile that lists "search_agent_ids" explicitly
 # says exactly what it may see and this name is not added to it.
@@ -95,6 +96,10 @@ def _load_config() -> dict:
               # Read through the profile scope like agent_id: under multiplexing the name of a
               # profile's shared layer lives in that profile's own .env, not the process env.
               "shared_agent_id": get_secret("MEM0_SHARED_AGENT_ID", "") or _DEFAULT_SHARED_AGENT_ID,
+              # Whether a turn may deliberately store into the shared layer. Configuring a layer is
+              # already the opt-in, so this defaults on; MEM0_SHARED_WRITES=false keeps a curated
+              # layer that profiles may read and only an operator fills.
+              "shared_writes": get_secret("MEM0_SHARED_WRITES", ""),
               "oss": {}}
     if user_id := get_secret("MEM0_USER_ID", ""):  # only when explicitly configured, so initialize() can fall back to the gateway-native id
         config["user_id"] = user_id
@@ -149,6 +154,32 @@ _SHARED_SCOPE_TOOL_NOTES = {
 }
 
 
+# Same, for a profile that may also store into the shared layer. Sharing is a parameter on the add
+# tool rather than a tool of its own, so the model cannot reach it without choosing it for one fact.
+_SHARED_WRITE_TOOL_NOTES = {
+    "mem0_search": " Results can come from your own memories or from shared memory.",
+    "mem0_add": (" It goes into your own memories unless you pass shared, which stores that one fact"
+                 " where every profile sharing this memory can read it."),
+    "mem0_update": " You may edit your own memories and entries in shared memory; anything else is refused.",
+    "mem0_delete": " You may delete your own memories and entries in shared memory; anything else is refused.",
+}
+_SHARED_ADD_PARAM = {
+    "shared": {
+        "type": "boolean",
+        "description": ("Store this in shared memory instead of your own, where every profile that"
+                        " shares it can read it. Default false. Only for something meant for"
+                        " everyone, never for anything private to this user."),
+    },
+}
+
+
+def _as_bool(value) -> bool:
+    """Tool arguments arrive as a bool or as the string a model typed."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
 def _shared_scopes(agent_id: str, search_agent_ids) -> list[str]:
     """The scopes recall may read besides the profile's own. Empty means own memories only.
 
@@ -167,6 +198,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._rerank_default, self._channel = False, "cli"  # channel = gateway name (cli/telegram/discord/...)
         self._search_agent_ids = frozenset()  # uninitialized providers cannot read memory
         self._shared_agent_id = _DEFAULT_SHARED_AGENT_ID
+        self._shared_write_target = None  # nor write it
         self._sync_max_chars = _SYNC_MSG_MAX_CHARS
         self._prefetch_query = self._prefetch_result = ""
         self._prefetch_done = self._atexit_registered = False
@@ -288,6 +320,17 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._agent_id not in ids or not isinstance(self._user_id, str) or not self._user_id.strip()):
             raise ValueError("Mem0 search_agent_ids must be a nonempty list of exact IDs including agent_id")
         self._search_agent_ids = frozenset(ids)
+        # Writing into the shared layer is deliberate (a parameter on mem0_add) and possible only
+        # where that layer is also readable, so a write can never land somewhere recall would not
+        # show it back. A profile that IS the shared identity has no separate target: every save it
+        # makes is already the shared one.
+        _sw = cfg.get("shared_writes", True)
+        if isinstance(_sw, str):
+            _sw = _sw.strip().lower() not in ("false", "0", "no", "off") if _sw.strip() else True
+        self._shared_write_target = (
+            self._shared_agent_id
+            if bool(_sw) and self._shared_agent_id in self._search_agent_ids
+            and self._shared_agent_id != self._agent_id else None)
         self._backend = self._create_backend()
         if self._backend and not self._atexit_registered:
             atexit.register(self._shutdown_backend)
@@ -308,9 +351,35 @@ class Mem0MemoryProvider(MemoryProvider):
                     results[row["id"]] = row
         return sorted(results.values(), key=lambda r: float(r.get("score") or 0), reverse=True)[:top_k]
 
-    def _add(self, messages: list, infer: bool):
+    def _add(self, messages: list, infer: bool, *, shared: bool = False):
         metadata = {"channel": self._channel} if self._channel else {}
-        return self._backend.add(messages, user_id=self._user_id, agent_id=self._agent_id, infer=infer, metadata=metadata)
+        agent_id = self._agent_id
+        if shared:
+            # Provenance is the price of a writable shared layer: an entry everyone reads must say
+            # which profile put it there, so a reader can weigh it and a bad one can be traced back.
+            # ``written_by`` is the writing profile's own agent id, the same identity recall scopes on.
+            agent_id = self._shared_write_target
+            metadata["written_by"] = self._agent_id
+        return self._backend.add(messages, user_id=self._user_id, agent_id=agent_id, infer=infer, metadata=metadata)
+
+    def _shared_duplicate(self, content: str) -> bool:
+        """True when this exact text already sits in shared memory.
+
+        Guards the loop where a model recalls a shared fact and deliberately stores it straight back.
+        Only an exact match after folding whitespace and case counts: judging near-duplicates is the
+        backend's job, and refusing a deliberate write on a guess is worse than keeping a duplicate.
+        Any backend trouble fails open for the same reason -- a transient error must not silently
+        swallow something the model meant to share.
+        """
+        wanted = " ".join(content.split()).casefold()
+        try:
+            rows = self._backend.search(
+                content, filters={"user_id": self._user_id, "agent_id": self._shared_write_target},
+                top_k=10, rerank=False)
+        except Exception:
+            return False
+        return any(" ".join(str(r.get("memory", "")).split()).casefold() == wanted
+                   for r in rows if isinstance(r, dict))
 
     def scope_note(self) -> str:
         """What recall covers and where a write lands, in the words the model reads.
@@ -324,6 +393,14 @@ class Mem0MemoryProvider(MemoryProvider):
             if self._agent_id == self._shared_agent_id:
                 note += " Other profiles recall from that same memory, so treat what you store as shared."
             return note
+        if self._shared_write_target:
+            return (
+                "Recall covers your own memories and shared memory. What you store goes into your own "
+                "memories unless you pass shared on mem0_add, which puts that one fact where every "
+                "profile sharing this memory can read it — so never put anything private to this user "
+                "there. You may also correct or remove entries in shared memory. Do not present what "
+                "you recall from shared memory as something this user told you."
+            )
         return (
             "Recall covers your own memories and shared memory you can read but not write. "
             "Everything you store goes into your own memories, and only those can be updated or "
@@ -405,8 +482,19 @@ class Mem0MemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if not _shared_scopes(self._agent_id, self._search_agent_ids):
             return list(TOOL_SCHEMAS)  # own memories only: nothing to distinguish, say nothing
-        return [{**s, "description": s["description"] + _SHARED_SCOPE_TOOL_NOTES.get(s["name"], "")}
-                for s in TOOL_SCHEMAS]
+        writable = bool(self._shared_write_target)
+        notes = _SHARED_WRITE_TOOL_NOTES if writable else _SHARED_SCOPE_TOOL_NOTES
+        schemas = []
+        for base in TOOL_SCHEMAS:
+            schema = {**base, "description": base["description"] + notes.get(base["name"], "")}
+            if writable and base["name"] == "mem0_add":
+                # The parameter exists only where there is somewhere to put it: a profile with a
+                # read-only or absent shared layer is never offered a knob it cannot use.
+                params = {**schema["parameters"]}
+                params["properties"] = {**params["properties"], **_SHARED_ADD_PARAM}
+                schema["parameters"] = params
+            schemas.append(schema)
+        return schemas
 
     # -- tool handlers: (required params, error label, body, client-error policy) ---
     # Client errors (bad ID / not found) never trip the breaker, except for mem0_add
@@ -423,18 +511,32 @@ class Mem0MemoryProvider(MemoryProvider):
         return json.dumps({"results": items, "count": len(items)})
 
     def _tool_add(self, args: dict) -> str:
-        result = self._add([{"role": "user", "content": args["content"]}], infer=False)
+        # Only an explicit parameter shares. The automatic turn sync never passes it, so nothing
+        # reaches the shared layer as a side effect of a conversation.
+        shared = _as_bool(args.get("shared"))
+        if shared and not self._shared_write_target:
+            return tool_error("This profile has no shared memory to store into")
+        if shared and self._shared_duplicate(args["content"]):
+            return json.dumps({"result": "Already in shared memory; nothing stored."})
+        result = self._add([{"role": "user", "content": args["content"]}], infer=False, shared=shared)
         event_id = result.get("event_id") if isinstance(result, dict) else None
         # Cloud add is async (server-side extraction); OSS and self-hosted store synchronously.
         msg = "Fact stored." if (self._mode == "oss" or self._host) else "Fact queued for storage."
+        if shared:  # say where it went, so the turn and its transcript both show it was shared
+            msg = f"{msg} In shared memory: every profile that shares it can read this."
         return json.dumps({"result": msg, "event_id": event_id})
 
     def _tool_mutate(self, args: dict, *, delete: bool = False) -> str:
         # Search grants read access to shared facts, never write access. Check the
         # current stored payload, not a prior search result supplied by the model.
         row = self._backend.get(args["memory_id"])
+        # A profile that may write shared memory may also correct or remove what is in it, whoever
+        # wrote it -- ``written_by`` is what makes that traceable. Every other scope stays owner-only.
+        allowed = {self._agent_id}
+        if self._shared_write_target:
+            allowed.add(self._shared_write_target)
         if (not isinstance(row, dict) or row.get("user_id") != self._user_id
-                or row.get("agent_id") != self._agent_id):
+                or row.get("agent_id") not in allowed):
             return tool_error("Memory not found or not owned by this profile")
         result = (self._backend.delete(args["memory_id"]) if delete else
                   self._backend.update(args["memory_id"], args["text"]))

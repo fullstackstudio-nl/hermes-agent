@@ -23,6 +23,7 @@ Both memory and delivery fixes below were running as hand-applied patches on a l
 | `Fix vulnerable dashboard dependencies` (carried, `75a3302c`) | `colord` and `sanitize-html` are pinned in `overrides` and raised in the lockfile (`2.9.3` to `2.10.0`, `2.17.6` to `2.17.7`). No package is added or removed and nothing else changes version. | Both were flagged against the dashboard's dependency tree. The `overrides` pins matter more than the lockfile bump: they stop a transitive dependency pulling a vulnerable version back in on the next resolve. | Yes, as soon as upstream's own lockfile carries both at or above these versions. |
 | `fix(memory): keep the shared layer a setting on the carried isolation` | The default recall scope is the profile's own agent plus the layer named by `shared_agent_id` (`MEM0_SHARED_AGENT_ID`, or `shared_agent_id` in `mem0.json`, default `shared`). The name is validated like any other entry in the scope. | The carried isolation defaults the scope to the profile's own agent alone, so a shared layer only exists where a profile spells it out in `search_agent_ids`. A gateway with a profile per customer or per department still needs one layer everyone may read, and a deployment that already holds memories under such a layer would lose recall of them the moment the default narrowed — silently, because nothing is renamed or migrated in the store. | Only together with the carried isolation above; it has no meaning without it. |
 | `feat(memory): tell the model which memories are its own and which are shared` | The prompt block and the four mem0 tool descriptions say that recall covers the profile's own memories plus shared memory it can read but not write, and that everything it stores lands in its own. Derived from the resolved scope: a profile with no shared memory is told nothing about any, and one whose own `agent_id` is the shared name is told that others read what it stores. No scope name is ever interpolated. | "You have memory" stopped being the whole truth once recall covered two scopes, and a model fills that gap wrongly in both directions -- presenting a fact recalled from the shared scope as something the user told it, and offering to save something for everyone, which no write path can do. A write always attaches the profile's own `agent_id`, so shared memory is read-only for an agent by construction, and the model has to be told so. | Only while we carry the isolation above; there is no second scope to describe without it. |
+| `feat(memory): let a turn store into shared memory when it says so` | `mem0_add` takes a `shared` parameter where a shared layer is configured and readable: that one fact is stored under the layer's name with `written_by` in its metadata naming the writing profile. `mem0_update` and `mem0_delete` accept a shared entry from such a profile; every other scope stays owner-only. The automatic turn sync never shares. `MEM0_SHARED_WRITES=false` keeps a layer read-only. | A layer nobody can write is decoration: a write attaches the writing profile's own `agent_id`, so before this the only way to fill one was to run a profile whose own id was the layer's name. The parameter makes sharing a deliberate act for one fact rather than a property of the profile, which is what keeps a conversation from filling a layer other profiles read. | Offer it upstream with the isolation; it is the other half of the same feature. |
 | `fix(bots): retry a delivery that failed because the target was busy` | `target_busy` becomes a constant, joins `ALL_REASONS` and is auto retryable. | A delivery that fails because the receiver is mid-turn is temporary. Without it such a message is dropped silently; raising `turn_wait_seconds` does not help, because deliveries serialise on the receiver's chat. | Yes, it is a plain bug fix. Offer it upstream. |
 
 ## Commits carried from another deployment
@@ -72,6 +73,23 @@ or `*` is refused outright and leaves the profile no recall at all; it no longer
 
 Recall costs one backend query per name in the scope, so the default is two: the profile's own agent
 and its shared layer.
+
+### Shared writes
+
+Writing is on wherever a layer is configured and readable, because configuring a layer is already the
+opt-in. A deployment that wants a curated layer -- read by every profile, filled only by an operator
+-- sets one line in the same place as the name:
+
+```
+MEM0_SHARED_WRITES=false
+```
+
+Two consequences worth knowing before turning a layer on. A profile that may write a layer may also
+edit and delete anything in it, including an entry another profile wrote; `written_by` in an entry's
+metadata is what makes that traceable, and entries written before this change do not carry it. And the
+write target is the layer named by `shared_agent_id`, which must be one the profile can actually read
+-- so a profile that sets `search_agent_ids` by hand must name the layer with `MEM0_SHARED_AGENT_ID`
+or `shared_agent_id` as well, or it can read the layer and not write it.
 
 The value is read when the agent is built, so restart the gateway (or open a new session) after
 adding the line.
