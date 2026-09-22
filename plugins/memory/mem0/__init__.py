@@ -134,6 +134,29 @@ _PROMPT_BODY = (
     "Tools: mem0_search to find memories, mem0_add to store facts, mem0_update and mem0_delete to manage by ID."
 )
 
+# Recall can cover more than one scope while a write only ever lands in the profile's own
+# (``_add`` attaches ``self._agent_id``, and ``_tool_mutate`` refuses a row owned by anyone
+# else). A model told only that it "has memory" states that wrongly in both directions: it
+# says "I remember" about a fact it read from another scope, and it offers to save something
+# "for the team" although it cannot. These notes say which is which, and they are added only
+# when a shared scope is actually configured -- see ``_shared_scopes``. No scope is ever named
+# here: a name belongs to whoever deployed the gateway, and this text goes into the prompt.
+_SHARED_SCOPE_TOOL_NOTES = {
+    "mem0_search": " Results can come from your own memories or from shared memory you can read but not write.",
+    "mem0_add": " The fact goes into your own memories, never into shared memory.",
+    "mem0_update": " Only your own memories can be edited; one recalled from shared memory is refused.",
+    "mem0_delete": " Only your own memories can be deleted; one recalled from shared memory is refused.",
+}
+
+
+def _shared_scopes(agent_id: str, search_agent_ids) -> list[str]:
+    """The scopes recall may read besides the profile's own. Empty means own memories only.
+
+    An uninitialized provider has an empty scope and so reads nothing, which lands here as
+    own-only -- the safe answer, because promising shared memory it cannot reach would be a lie.
+    """
+    return sorted(set(search_agent_ids) - {agent_id})
+
 
 class Mem0MemoryProvider(MemoryProvider):
     """Mem0 memory with server-side extraction and semantic search (platform, self-hosted or OSS)."""
@@ -289,11 +312,30 @@ class Mem0MemoryProvider(MemoryProvider):
         metadata = {"channel": self._channel} if self._channel else {}
         return self._backend.add(messages, user_id=self._user_id, agent_id=self._agent_id, infer=infer, metadata=metadata)
 
+    def scope_note(self) -> str:
+        """What recall covers and where a write lands, in the words the model reads.
+
+        Derived from the resolved scope rather than fixed, so a profile with no shared memory
+        is not told it has any, and a profile that IS the shared identity -- its own agent_id
+        is the shared name, so its writes are what the others read -- is told that instead.
+        """
+        if not _shared_scopes(self._agent_id, self._search_agent_ids):
+            note = "Recall covers your own memories only, and that is also where everything you store goes."
+            if self._agent_id == self._shared_agent_id:
+                note += " Other profiles recall from that same memory, so treat what you store as shared."
+            return note
+        return (
+            "Recall covers your own memories and shared memory you can read but not write. "
+            "Everything you store goes into your own memories, and only those can be updated or "
+            "deleted. Do not offer to save anything into shared memory, and do not present what "
+            "you recall from it as something this user told you."
+        )
+
     def system_prompt_block(self) -> str:
         # Mirror _create_backend precedence (oss > host > platform). Rerank is a Mem0 Platform feature only.
         mode_label = "OSS (self-hosted)" if self._mode == "oss" else "self-hosted (HTTP API)" if self._host else "platform (cloud API)"
         rerank_note = " Rerank is available on search." if (self._mode == "platform" and not self._host) else ""
-        return f"# Mem0 Memory\nActive. Mode: {mode_label}. User: {self._user_id}.\n{_PROMPT_BODY}{rerank_note}"
+        return f"# Mem0 Memory\nActive. Mode: {mode_label}. User: {self._user_id}.\n{_PROMPT_BODY}{rerank_note}\n{self.scope_note()}"
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._start_prefetch(message)
@@ -361,7 +403,10 @@ class Mem0MemoryProvider(MemoryProvider):
             self._sync_thread.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return list(TOOL_SCHEMAS)
+        if not _shared_scopes(self._agent_id, self._search_agent_ids):
+            return list(TOOL_SCHEMAS)  # own memories only: nothing to distinguish, say nothing
+        return [{**s, "description": s["description"] + _SHARED_SCOPE_TOOL_NOTES.get(s["name"], "")}
+                for s in TOOL_SCHEMAS]
 
     # -- tool handlers: (required params, error label, body, client-error policy) ---
     # Client errors (bad ID / not found) never trip the breaker, except for mem0_add

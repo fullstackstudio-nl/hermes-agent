@@ -182,3 +182,106 @@ class TestSharedLayerRecall:
         provider._add([{"role": "user", "content": "remember this"}], infer=False)
 
         assert fake.added == [{"user_id": _TENANT, "agent_id": "team-two"}]
+
+
+class TestWhatTheModelIsTold:
+    """The prompt and the tool descriptions must match the scope the profile actually has.
+
+    A model told only that it "has memory" gets it wrong in both directions: it reports
+    something it read from shared memory as a fact the user told it, and it offers to save
+    something for the whole team although every write attaches its own agent_id. The wording is
+    derived from the resolved scope, so a profile without shared memory is never promised any.
+    """
+
+    def test_a_profile_with_shared_memory_is_told_it_can_read_but_not_write_it(
+            self, monkeypatch, tmp_path):
+        provider, _ = _provider(monkeypatch, tmp_path, env={"MEM0_AGENT_ID": "team-two"})
+
+        note = provider.scope_note()
+
+        assert "read but not write" in note
+        assert "Everything you store goes into your own memories" in note
+        assert "Do not offer to save anything into shared memory" in note
+        assert note in provider.system_prompt_block()
+
+    def test_a_profile_without_shared_memory_is_not_promised_any(self, monkeypatch, tmp_path):
+        """An explicit scope of just its own agent has no shared memory, so the wording must not
+        mention any. This is the case the text is derived for."""
+        provider, _ = _provider(
+            monkeypatch, tmp_path, env={"MEM0_AGENT_ID": "team-two"},
+            file_cfg={"search_agent_ids": ["team-two"]})
+
+        note = provider.scope_note()
+
+        assert "shared" not in note.lower()
+        assert "your own memories only" in note
+        assert note in provider.system_prompt_block()
+
+    def test_the_shared_identity_is_told_that_others_read_what_it_stores(
+            self, monkeypatch, tmp_path):
+        """A profile whose own agent_id IS the shared name writes where everyone else reads. It
+        has no second scope to warn about, but it does need to know that."""
+        provider, _ = _provider(
+            monkeypatch, tmp_path,
+            env={"MEM0_AGENT_ID": "house-layer", "MEM0_SHARED_AGENT_ID": "house-layer"})
+
+        note = provider.scope_note()
+
+        assert provider._search_agent_ids == {"house-layer"}
+        assert "Other profiles recall from that same memory" in note
+
+    def test_no_scope_name_is_ever_put_in_the_prompt(self, monkeypatch, tmp_path):
+        """The scope names belong to whoever deployed the gateway. They must not travel into the
+        prompt or a tool description just because they are configured."""
+        provider, _ = _provider(
+            monkeypatch, tmp_path,
+            env={"MEM0_AGENT_ID": "team-two", "MEM0_SHARED_AGENT_ID": "a-named-layer"})
+
+        text = provider.system_prompt_block() + "".join(
+            s["description"] for s in provider.get_tool_schemas())
+
+        assert "a-named-layer" not in text
+        assert "team-two" not in text
+
+    def test_the_tools_say_where_a_write_lands_when_shared_memory_is_readable(
+            self, monkeypatch, tmp_path):
+        provider, _ = _provider(monkeypatch, tmp_path, env={"MEM0_AGENT_ID": "team-two"})
+
+        described = {s["name"]: s["description"] for s in provider.get_tool_schemas()}
+
+        assert "never into shared memory" in described["mem0_add"]
+        assert "read but not write" in described["mem0_search"]
+        assert "refused" in described["mem0_update"] and "refused" in described["mem0_delete"]
+
+    def test_the_tools_stay_silent_about_sharing_when_there_is_none(self, monkeypatch, tmp_path):
+        provider, _ = _provider(
+            monkeypatch, tmp_path, env={"MEM0_AGENT_ID": "team-two"},
+            file_cfg={"search_agent_ids": ["team-two"]})
+
+        described = {s["name"]: s["description"] for s in provider.get_tool_schemas()}
+
+        assert not any("shared memory" in d for d in described.values())
+        assert sorted(described) == ["mem0_add", "mem0_delete", "mem0_search", "mem0_update"]
+
+    def test_an_uninitialized_provider_promises_nothing(self):
+        """It can read nothing at all, so shared memory must not be advertised."""
+        provider = mem0.Mem0MemoryProvider()
+        provider._user_id = "someone"
+
+        assert "shared" not in provider.scope_note().lower()
+        assert not any("shared memory" in s["description"] for s in provider.get_tool_schemas())
+
+    def test_what_the_tools_claim_is_what_the_code_does(self, monkeypatch, tmp_path):
+        """The descriptions are only honest while a write keeps landing in the profile's own
+        scope and a row owned by another scope stays unwritable. Tie the wording to both."""
+        backend = _FakeBackend([_row("1", "shared fact", "shared", 0.9)])
+        backend.rows = {"1": dict(backend.results[0])}
+        backend.get = lambda memory_id: backend.rows.get(memory_id)
+        provider, fake = _provider(
+            monkeypatch, tmp_path, env={"MEM0_AGENT_ID": "team-two"}, backend=backend)
+
+        provider._add([{"role": "user", "content": "a fact"}], infer=False)
+        assert fake.added == [{"user_id": _TENANT, "agent_id": "team-two"}]
+
+        refused = provider._tool_mutate({"memory_id": "1", "text": "overwrite"})
+        assert "error" in json.loads(refused)
