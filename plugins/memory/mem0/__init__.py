@@ -236,15 +236,35 @@ class Mem0MemoryProvider(MemoryProvider):
         self._rerank_default = _rr.lower() in ("true", "1", "yes") if isinstance(_rr, str) else bool(_rr)
         self._channel = kwargs.get("platform") or "cli"
         self._sync_max_chars = int(cfg.get("sync_max_chars") or _SYNC_MSG_MAX_CHARS)
+        # Profile-scoped recall: which agent_ids this profile may see. Search is filtered on
+        # user_id only by the backend (mem0's search rejects a list/operator on agent_id — it
+        # runs entity-id validation before operator processing), so we over-fetch and post-filter
+        # on the agent_id field that every result carries. Absent key => own agent_id + fss-shared
+        # shared layer. Empty list ([]) => no filtering (see all agents under this user_id).
+        sai = cfg.get("search_agent_ids")
+        if sai is None:
+            self._search_agent_ids = {self._agent_id, "fss-shared"}
+        elif isinstance(sai, list):
+            self._search_agent_ids = {str(x) for x in sai if x} or None
+        else:
+            self._search_agent_ids = {str(sai)} if sai else None
         self._backend = self._create_backend()
         if self._backend and not self._atexit_registered:
             atexit.register(self._shutdown_backend)
             self._atexit_registered = True
 
     def _search(self, query: str, top_k: int = 10, rerank: bool = False, backend=None) -> list:
-        # Scoped to user_id only — by design — so recall surfaces memories from any gateway/agent under this
-        # principal; writes attach agent_id and metadata.channel so narrower views remain possible at query time.
-        return (backend or self._backend).search(query, filters={"user_id": self._user_id}, top_k=top_k, rerank=rerank)
+        # Scoped to user_id at the backend; agent_id post-filtering (self._search_agent_ids) keeps
+        # recall inside this profile's allowed agents + the fss-shared layer, while writes still
+        # attach this profile's own agent_id. We over-fetch (×3, min 30) because filtering shrinks
+        # the effective result set, then trim back to top_k. No allow-set => legacy user_id-only recall.
+        allow = self._search_agent_ids
+        fetch = top_k if not allow else max(top_k * 3, 30)
+        results = (backend or self._backend).search(query, filters={"user_id": self._user_id}, top_k=fetch, rerank=rerank)
+        if not allow:
+            return results
+        filtered = [r for r in results if r.get("agent_id") in allow]
+        return filtered[:top_k]
 
     def _add(self, messages: list, infer: bool):
         metadata = {"channel": self._channel} if self._channel else {}

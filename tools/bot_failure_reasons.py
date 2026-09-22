@@ -18,6 +18,9 @@ RUNTIME_OFFLINE = "runtime_offline"
 QUEUED_EXPIRED = "queued_expired"
 DELIVERY_TIMEOUT = "delivery_timeout"
 AGENT_BLOCKED = "agent_blocked"
+#: FSS-patch 18-09-2026: bestond als string in bot_relay/bot_mode_dm maar niet als
+#: constante hier, waardoor hij niet in AUTO_RETRYABLE kon staan.
+TARGET_BUSY = "target_busy"
 CANCELLED = "cancelled"
 
 # agent-side
@@ -31,13 +34,18 @@ MODEL_UNAVAILABLE = "model_unavailable"
 UNKNOWN = "unknown"
 
 ALL_REASONS = frozenset({
-    RUNTIME_OFFLINE, QUEUED_EXPIRED, DELIVERY_TIMEOUT, AGENT_BLOCKED, CANCELLED,
+    RUNTIME_OFFLINE, QUEUED_EXPIRED, DELIVERY_TIMEOUT, AGENT_BLOCKED, TARGET_BUSY, CANCELLED,
     PROVIDER_AUTH_OR_ACCESS, PROVIDER_QUOTA_LIMIT, PROVIDER_RATE_LIMIT,
     PROVIDER_SERVER_ERROR, CONTEXT_OVERFLOW, MISSING_CONFIG, MODEL_UNAVAILABLE, UNKNOWN,
 })
 
 #: Reasons a supervisor may retry automatically without human intervention.
-AUTO_RETRYABLE = frozenset({RUNTIME_OFFLINE, DELIVERY_TIMEOUT, PROVIDER_RATE_LIMIT, PROVIDER_SERVER_ERROR})
+#: FSS-patch 18-09-2026: TARGET_BUSY toegevoegd. Een bezorging die strandt omdat de
+#: ontvanger al een beurt draait, is per definitie tijdelijk -- precies het geval
+#: waarvoor een retry bedoeld is. Zonder deze regel viel elke DM naar een bezette
+#: agent stil weg (boekhouders Moneybird-vraag ging er twee keer door verloren).
+#: Wordt overschreven bij een hermes-update; origineel in ~/.hermes/patches-hermes/.
+AUTO_RETRYABLE = frozenset({RUNTIME_OFFLINE, DELIVERY_TIMEOUT, PROVIDER_RATE_LIMIT, PROVIDER_SERVER_ERROR, TARGET_BUSY})
 
 
 def is_auto_retryable(reason: str) -> bool:
