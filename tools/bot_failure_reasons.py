@@ -18,8 +18,8 @@ RUNTIME_OFFLINE = "runtime_offline"
 QUEUED_EXPIRED = "queued_expired"
 DELIVERY_TIMEOUT = "delivery_timeout"
 AGENT_BLOCKED = "agent_blocked"
-#: FSS-patch 18-09-2026: bestond als string in bot_relay/bot_mode_dm maar niet als
-#: constante hier, waardoor hij niet in AUTO_RETRYABLE kon staan.
+#: The string already existed in bot_relay and bot_mode_dm but not as a constant
+#: here, so it could never be listed in AUTO_RETRYABLE.
 TARGET_BUSY = "target_busy"
 CANCELLED = "cancelled"
 
@@ -40,11 +40,9 @@ ALL_REASONS = frozenset({
 })
 
 #: Reasons a supervisor may retry automatically without human intervention.
-#: FSS-patch 18-09-2026: TARGET_BUSY toegevoegd. Een bezorging die strandt omdat de
-#: ontvanger al een beurt draait, is per definitie tijdelijk -- precies het geval
-#: waarvoor een retry bedoeld is. Zonder deze regel viel elke DM naar een bezette
-#: agent stil weg (boekhouders Moneybird-vraag ging er twee keer door verloren).
-#: Wordt overschreven bij een hermes-update; origineel in ~/.hermes/patches-hermes/.
+#: TARGET_BUSY belongs here: a delivery that fails because the receiving agent is
+#: already running a turn is temporary by definition, which is what a retry is for.
+#: Without it a message to a busy agent is dropped silently.
 AUTO_RETRYABLE = frozenset({RUNTIME_OFFLINE, DELIVERY_TIMEOUT, PROVIDER_RATE_LIMIT, PROVIDER_SERVER_ERROR, TARGET_BUSY})
 
 
