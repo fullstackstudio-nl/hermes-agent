@@ -259,7 +259,9 @@ class TestMem0Prefetch:
         provider._prefetch_thread.join(timeout=1)
         result = provider.prefetch("where do I live?")
         assert "lives in Berlin" in result
-        assert len([c for c in backend.captured if c[0] == "search"]) == 1
+        # One recall, not two: the prefetched result must be reused. A recall issues one
+        # scoped query per allowed agent_id, so count scopes rather than assuming a single query.
+        assert len([c for c in backend.captured if c[0] == "search"]) == len(provider._search_agent_ids)
 
     def test_slow_prefetch_returns_quickly(self, monkeypatch):
         entered = threading.Event()

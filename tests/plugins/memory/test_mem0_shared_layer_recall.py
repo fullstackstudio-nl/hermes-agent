@@ -1,9 +1,12 @@
 """The mem0 shared memory layer: its name is a setting, and only recall uses it.
 
-Recall is scoped to ``user_id`` at the backend and post-filtered on ``agent_id``, so a
-profile sees its own agent plus one shared layer. The layer's name must be configurable:
-a host may want one house layer, a layer per customer or a layer per department, and a
-default baked into the code cannot serve all three.
+Recall is scoped to ``user_id`` and ``agent_id`` at the backend, one query per allowed
+agent, so a profile sees its own agent plus one shared layer. The layer's name must be
+configurable: a host may want one house layer, a layer per customer or a layer per
+department, and a default baked into the code cannot serve all three.
+
+The name is validated exactly like an explicitly configured ``search_agent_ids`` entry,
+so a blank or wildcard name fails the profile closed rather than widening recall.
 
 Writes are deliberately NOT part of this: ``_add`` always attaches the writing profile's
 own ``agent_id``, so the shared layer is populated by running something whose
@@ -17,9 +20,19 @@ import pytest
 
 import plugins.memory.mem0 as mem0
 
+_TENANT = "tenant-one"
+
+
+def _row(ident, memory, agent_id, score, user_id=_TENANT):
+    return {"id": ident, "memory": memory, "agent_id": agent_id, "user_id": user_id, "score": score}
+
 
 class _FakeBackend:
-    """Records what was searched/added and replays a fixed result set."""
+    """Records what was searched/added and replays a fixed result set.
+
+    It honours ``filters`` the way a real backend does, because recall now pushes both
+    ``user_id`` and ``agent_id`` down instead of over-fetching and trimming.
+    """
 
     def __init__(self, results=()):
         self.results = [dict(r) for r in results]
@@ -28,7 +41,10 @@ class _FakeBackend:
 
     def search(self, query, filters=None, top_k=10, rerank=False):
         self.searches.append({"query": query, "filters": filters, "top_k": top_k})
-        return [dict(r) for r in self.results]
+        rows = [dict(r) for r in self.results]
+        for key, value in (filters or {}).items():
+            rows = [r for r in rows if r.get(key) == value]
+        return rows[:top_k]
 
     def add(self, messages, user_id=None, agent_id=None, infer=True, metadata=None):
         self.added.append({"user_id": user_id, "agent_id": agent_id})
@@ -55,6 +71,7 @@ def _provider(monkeypatch, tmp_path, *, file_cfg=None, env=None, backend=None):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     for name in ("MEM0_AGENT_ID", "MEM0_SHARED_AGENT_ID", "MEM0_USER_ID", "MEM0_HOST", "MEM0_MODE"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MEM0_USER_ID", _TENANT)
     for name, value in (env or {}).items():
         monkeypatch.setenv(name, value)
     if file_cfg is not None:
@@ -103,13 +120,21 @@ class TestSharedLayerName:
 
         assert provider._search_agent_ids == {"team-two", "audit"}
 
-    def test_an_empty_allow_list_still_disables_filtering(self, monkeypatch, tmp_path):
-        """The documented escape hatch: [] means "see every agent under this user_id"."""
-        provider, _ = _provider(
-            monkeypatch, tmp_path, env={"MEM0_AGENT_ID": "team-two"},
-            file_cfg={"search_agent_ids": []})
+    def test_an_empty_allow_list_fails_the_profile_closed(self, monkeypatch, tmp_path):
+        """``[]`` used to mean "see every agent under this user_id". It must not: an empty or
+        malformed scope is a configuration mistake, and the safe reading of a mistake is no
+        recall at all, never everyone's."""
+        with pytest.raises(ValueError):
+            _provider(monkeypatch, tmp_path, env={"MEM0_AGENT_ID": "team-two"},
+                      file_cfg={"search_agent_ids": []})
 
-        assert provider._search_agent_ids is None
+    @pytest.mark.parametrize("name", [" ", " padded", "*"], ids=["blank", "padded", "wildcard"])
+    def test_an_unusable_shared_layer_name_fails_the_profile_closed(self, monkeypatch, tmp_path, name):
+        """The configured name reaches the store as an exact id, so it gets the same validation
+        as any other entry — a typo must not silently become a scope nobody meant."""
+        with pytest.raises(ValueError):
+            _provider(monkeypatch, tmp_path,
+                      env={"MEM0_AGENT_ID": "team-two", "MEM0_SHARED_AGENT_ID": name})
 
 
 class TestSharedLayerRecall:
@@ -122,9 +147,10 @@ class TestSharedLayerRecall:
     def test_recall_covers_own_agent_and_the_shared_layer_only(
             self, monkeypatch, tmp_path, shared_name, env):
         backend = _FakeBackend([
-            {"memory": "mine", "agent_id": "team-two"},
-            {"memory": "shared fact", "agent_id": shared_name},
-            {"memory": "another customer's", "agent_id": "team-three"},
+            _row("1", "mine", "team-two", 0.9),
+            _row("2", "shared fact", shared_name, 0.5),
+            _row("3", "another customer's", "team-three", 0.8),
+            _row("4", "another tenant's", shared_name, 0.7, user_id="tenant-two"),
         ])
         provider, fake = _provider(
             monkeypatch, tmp_path, env={"MEM0_AGENT_ID": "team-two", **env}, backend=backend)
@@ -132,12 +158,15 @@ class TestSharedLayerRecall:
         found = provider._search("anything", top_k=10)
 
         assert [r["memory"] for r in found] == ["mine", "shared fact"]
-        # user_id is all the backend can filter on; the agent_id trim happens here.
-        assert fake.searches[0]["filters"] == {"user_id": provider._user_id}
+        # One query per allowed agent, each scoped to this tenant at the backend.
+        assert {frozenset(call["filters"].items()) for call in fake.searches} == {
+            frozenset({"user_id": _TENANT, "agent_id": "team-two"}.items()),
+            frozenset({"user_id": _TENANT, "agent_id": shared_name}.items()),
+        }
 
     def test_a_name_that_is_not_configured_is_not_recalled(self, monkeypatch, tmp_path):
         """Renaming the layer must actually narrow recall — otherwise the setting is decoration."""
-        backend = _FakeBackend([{"memory": "old layer", "agent_id": "some-other-layer"}])
+        backend = _FakeBackend([_row("1", "old layer", "some-other-layer", 0.9)])
         provider, _ = _provider(
             monkeypatch, tmp_path,
             env={"MEM0_AGENT_ID": "team-two", "MEM0_SHARED_AGENT_ID": "house-layer"},
@@ -152,4 +181,4 @@ class TestSharedLayerRecall:
 
         provider._add([{"role": "user", "content": "remember this"}], infer=False)
 
-        assert fake.added == [{"user_id": provider._user_id, "agent_id": "team-two"}]
+        assert fake.added == [{"user_id": _TENANT, "agent_id": "team-two"}]

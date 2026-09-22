@@ -143,6 +143,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._mode, self._api_key, self._host, self._user_id, self._agent_id = "platform", "", "", _DEFAULT_USER_ID, "hermes"
         self._rerank_default, self._channel = False, "cli"  # channel = gateway name (cli/telegram/discord/...)
         self._search_agent_ids = frozenset()  # uninitialized providers cannot read memory
+        self._shared_agent_id = _DEFAULT_SHARED_AGENT_ID
         self._sync_max_chars = _SYNC_MSG_MAX_CHARS
         self._prefetch_query = self._prefetch_result = ""
         self._prefetch_done = self._atexit_registered = False
@@ -249,10 +250,15 @@ class Mem0MemoryProvider(MemoryProvider):
         self._rerank_default = _rr.lower() in ("true", "1", "yes") if isinstance(_rr, str) else bool(_rr)
         self._channel = kwargs.get("platform") or "cli"
         self._sync_max_chars = int(cfg.get("sync_max_chars") or _SYNC_MSG_MAX_CHARS)
-        # Missing scope means own memories only; null/empty/malformed never means all.
+        # Missing scope means own memories plus the shared layer; null/empty/malformed never means all.
+        # The shared layer's name is a setting (see _DEFAULT_SHARED_AGENT_ID) rather than a default
+        # allow-list of one, because a profile per customer or per department still needs one layer
+        # it may read. It goes through the same validation as an explicit list: a blank, padded or
+        # wildcard name fails the profile closed instead of widening recall.
         self._backend = None
         self._search_agent_ids = frozenset()
-        ids = cfg.get("search_agent_ids", [self._agent_id])
+        self._shared_agent_id = str(cfg.get("shared_agent_id") or _DEFAULT_SHARED_AGENT_ID)
+        ids = cfg.get("search_agent_ids", [self._agent_id, self._shared_agent_id])
         if (not isinstance(ids, list) or not ids or
                 any(not isinstance(x, str) or not x.strip() or x != x.strip() or x == "*" for x in ids) or
                 not isinstance(self._agent_id, str) or not self._agent_id.strip() or

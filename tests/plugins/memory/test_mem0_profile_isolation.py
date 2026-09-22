@@ -100,7 +100,7 @@ def test_profile_reads_writes_prefetch_and_sync_stay_scoped_a_b_a(tmp_path, monk
         secret_scope.set_multiplex_active(False)
 
 
-def test_bad_scope_fails_closed_and_missing_scope_is_own_only(tmp_path, monkeypatch):
+def test_bad_scope_fails_closed_and_missing_scope_is_own_plus_shared_layer(tmp_path, monkeypatch):
     backend = Store()
     monkeypatch.setattr(Mem0MemoryProvider, "_create_backend", lambda self: backend)
     config = dict(mode="oss", user_id="human", agent_id="a")
@@ -117,5 +117,7 @@ def test_bad_scope_fails_closed_and_missing_scope_is_own_only(tmp_path, monkeypa
         p.initialize("test")
         backend.add([{"content": "shared"}], user_id="human", agent_id="shared")
         backend.add([{"content": "own"}], user_id="human", agent_id="a")
-        assert {r["memory"] for r in p._search("anything")} == {"own"}
+        backend.add([{"content": "another tenant"}], user_id="human", agent_id="foreign")
+        # Widening the default to the shared layer must not widen it to anything else.
+        assert {r["memory"] for r in p._search("anything")} == {"own", "shared"}
         p.shutdown()
