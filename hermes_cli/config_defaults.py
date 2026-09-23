@@ -38,6 +38,13 @@ DEFAULT_CONFIG = {
     },
     # Soft fd limit for long-running server processes; clamped to OS hard limit. 0/false/null = off.
     "runtime": {"nofile_soft_limit": 4096},
+    # Ceiling on how many profiles may exist on this gateway (default profile plus every named
+    # one — exactly what `hermes profile list` shows). `hermes profile create` refuses once that
+    # many exist, the same way through the CLI, the dashboard REST route and the RPC. Read from
+    # the default profile's own config.yaml regardless of which profile is active, since profiles/
+    # always lives under the default home. 0 (also accepted: null/unset) = unlimited (default;
+    # nothing changes for an operator who never sets it).
+    "profiles": {"max": 0},
     # Global active chat session cap across CLI, TUI/dashboard, and messaging. None/0 = unbounded.
     "max_concurrent_sessions": None,
     # Soft LRU cap on in-memory TUI/desktop/dashboard sessions. Above it the gateway evicts the

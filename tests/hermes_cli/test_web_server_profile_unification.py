@@ -408,6 +408,33 @@ class TestProfileScopedModel:
         assert resp.status_code == 404
 
 
+class TestProfileCreateMaxLimit:
+    """`profiles.max` enforced through the REST create route (POST /api/profiles), the same
+    chokepoint (`create_profile()`) the CLI and the RPC call through."""
+
+    def test_refused_at_the_limit_with_a_400_naming_the_limit_and_the_count(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        # isolated_profiles already has default + worker_beta = 2 profiles.
+        (isolated_profiles["default"] / "config.yaml").write_text(
+            "profiles:\n  max: 2\n", encoding="utf-8")
+        resp = client.post("/api/profiles", json={"name": "onemore"})
+        assert resp.status_code == 400
+        assert "allows 2 profiles and already has 2" in resp.json()["detail"]
+        assert not (isolated_profiles["default"] / "profiles" / "onemore").exists()
+
+    def test_succeeds_below_the_limit(self, client, isolated_profiles, monkeypatch):
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        (isolated_profiles["default"] / "config.yaml").write_text(
+            "profiles:\n  max: 3\n", encoding="utf-8")
+        resp = client.post("/api/profiles", json={"name": "roomleft"})
+        assert resp.status_code == 200
+        assert (isolated_profiles["default"] / "profiles" / "roomleft").is_dir()
+
+
 class TestProfileScopedPostSetup:
     def test_post_setup_spawns_with_profile_flag(
         self, client, isolated_profiles, monkeypatch

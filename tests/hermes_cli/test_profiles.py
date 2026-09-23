@@ -332,6 +332,92 @@ class TestCreateProfile:
         assert not (profile_dir / "home" / ".agent-browser" / "control").exists()
 
 
+class TestProfilesMaxLimit:
+    """Tests for the ``profiles.max`` operator ceiling on ``create_profile()`` — the chokepoint
+    the CLI, the dashboard REST route and the RPC all call through."""
+
+    def test_unset_is_unlimited(self, profile_env):
+        """No `profiles:` section at all: existing behaviour, unchanged."""
+        for i in range(5):
+            create_profile(f"worker{i}", no_alias=True)
+        assert len(list_profiles()) == 6  # default + 5
+
+    def test_zero_is_unlimited(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text("profiles:\n  max: 0\n")
+        create_profile("one", no_alias=True)
+        create_profile("two", no_alias=True)
+        assert {p.name for p in list_profiles()} == {"default", "one", "two"}
+
+    def test_creation_succeeds_below_the_limit(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text("profiles:\n  max: 3\n")
+        create_profile("one", no_alias=True)
+        # default + one = 2, still under 3.
+        assert {p.name for p in list_profiles()} == {"default", "one"}
+
+    def test_creation_refused_at_the_limit(self, profile_env):
+        """`default` counts: `profiles.max: 1` means no named profile can ever be created."""
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text("profiles:\n  max: 1\n")
+        with pytest.raises(ValueError, match=r"allows 1 profiles and already has 1"):
+            create_profile("one", no_alias=True)
+        assert [p.name for p in list_profiles()] == ["default"]
+
+    def test_refusal_message_names_the_limit_and_the_current_count(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text("profiles:\n  max: 2\n")
+        create_profile("one", no_alias=True)
+        with pytest.raises(ValueError, match=r"allows 2 profiles and already has 2"):
+            create_profile("two", no_alias=True)
+
+    def test_count_matches_the_profile_listing(self, profile_env):
+        """The refusal must count exactly what `list_profiles()` (`hermes profile list`) shows —
+        no second notion of what a profile is."""
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text("profiles:\n  max: 4\n")
+        create_profile("one", no_alias=True)
+        create_profile("two", no_alias=True)
+        assert len(list_profiles()) == 3  # default + one + two
+        create_profile("three", no_alias=True)
+        assert len(list_profiles()) == 4  # default + one + two + three
+        with pytest.raises(ValueError, match=r"already has 4"):
+            create_profile("four", no_alias=True)
+
+    def test_limit_lower_than_existing_count_does_not_disturb_existing_profiles(self, profile_env):
+        """Lowering the ceiling below what already exists must not break anything that already
+        works: existing profiles stay listed and usable, only NEW creates are refused."""
+        default_home = profile_env / ".hermes"
+        create_profile("one", no_alias=True)
+        create_profile("two", no_alias=True)
+        # default + one + two = 3 already; now cap at 1.
+        (default_home / "config.yaml").write_text("profiles:\n  max: 1\n")
+        assert {p.name for p in list_profiles()} == {"default", "one", "two"}
+        with pytest.raises(ValueError, match=r"allows 1 profiles and already has 3"):
+            create_profile("three", no_alias=True)
+        # The existing profiles are untouched by the refused create.
+        assert {p.name for p in list_profiles()} == {"default", "one", "two"}
+
+    def test_non_numeric_max_is_treated_as_unlimited(self, profile_env):
+        """A malformed value must never crash profile creation; it degrades to unlimited."""
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text("profiles:\n  max: unlimited\n")
+        create_profile("one", no_alias=True)
+        assert {p.name for p in list_profiles()} == {"default", "one"}
+
+    def test_limit_is_read_from_the_default_home_not_a_named_profile(self, profile_env, monkeypatch):
+        """The ceiling is a gateway-wide setting: a named profile's own config.yaml never
+        supplies it, even when this process's active HERMES_HOME is that named profile."""
+        default_home = profile_env / ".hermes"
+        (default_home / "config.yaml").write_text("profiles:\n  max: 5\n")
+        create_profile("worker", no_alias=True)
+        worker_home = default_home / "profiles" / "worker"
+        (worker_home / "config.yaml").write_text("profiles:\n  max: 1\n")
+        # Simulate `hermes -p worker profile create ...`: HERMES_HOME points at the named profile.
+        monkeypatch.setenv("HERMES_HOME", str(worker_home))
+        # Still governed by the default home's max: 5, not the named profile's 1.
+        create_profile("second", no_alias=True)
+        assert {p.name for p in list_profiles()} == {"default", "worker", "second"}
 
 
 
