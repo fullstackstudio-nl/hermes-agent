@@ -4,8 +4,33 @@
 
 ## How it is kept
 
-- `main` is a copy of upstream. Never commit to it. Update it with `git fetch upstream && git push origin upstream/main:main`.
-- `fss` carries our changes, rebased onto `main` whenever upstream moves. Rebase often; a small delta stays cheap.
+- `main` carries our changes. `hermes update` installs the branch `main` when none is named, and the
+  dashboard's update button never names one, so our code has to be what `main` points at — otherwise
+  an update replaces a running deployment with plain upstream and takes the memory isolation below
+  with it. Putting our code here makes the default correct for every host, a fresh clone included,
+  without anyone having to know a setting.
+- `upstream-main` is the copy of upstream and nothing else. Never commit to it. Update it with
+  `git fetch upstream && git push origin upstream/main:upstream-main`.
+- Bring upstream in by MERGING `upstream-main` into `main`. Never rebase `main` and never force-push
+  it. Deployments run `main` now: a rebase rewrites the branch under them, and `hermes update` on a
+  checkout that is on `main` and cannot fast-forward runs `git reset --hard origin/main` without
+  tagging or stashing first. Merging keeps every update a fast-forward. Merge often; a small delta
+  stays cheap.
+- Nothing that runs this fork commits to `main`. A local commit there is discarded by the reset path
+  above, with no prompt and no recovery tag — the updater only writes a rescue ref when the histories
+  share no ancestor at all. Work that belongs to one deployment goes on its own branch and is
+  installed with `hermes update --branch <name>`, which is the one case the updater merges instead of
+  resetting.
+- `fss` is held at the same commit as `main` while installs made from it move across. It is not a
+  second line of development: it advances with `main` or not at all, and it is deleted once nothing
+  is checked out on it.
+- Never add a remote named `upstream` to a checkout that RUNS this fork. On the branch `main`,
+  `hermes update --check` prefers a remote by exactly that name and compares the checkout against the
+  real upstream, so it reports an update that is permanently available and must never be installed
+  (`hermes_cli/update_cmd.py`). The name is matched literally, so a remote called anything else is
+  invisible to the updater and is how you keep upstream fetchable. The apply path is already safe
+  once `main` carries commits upstream does not have: it counts `upstream/main..origin/main` and
+  skips the upstream sync while that is non-zero (`hermes_cli/update_cmd_git.py`).
 - Every change is one commit with a message that says why, and a row in the table below. A change that upstream takes is dropped from the fork.
 - Anything that can live in the Hermie plugin belongs in the plugin, not here.
 
