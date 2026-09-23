@@ -1,4 +1,12 @@
 <p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fullstackstudio-logo-dark.svg">
+    <img src="docs/assets/fullstackstudio-logo-light.svg" alt="FullStack Studio" width="220">
+  </picture>
+</p>
+<p align="center"><sub>This fork is maintained by <a href="https://fullstackstudio.nl">FullStack Studio</a></sub></p>
+
+<p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
 
@@ -16,6 +24,8 @@
   <a href="README.es.md"><img src="https://img.shields.io/badge/Lang-Español-orange?style=for-the-badge" alt="Español"></a>
 </p>
 
+This is a fork of [Hermes Agent](https://github.com/NousResearch/hermes-agent), an open-source project by [Nous Research](https://nousresearch.com) released under the MIT license. FullStack Studio maintains this fork independently to run a small set of changes its own deployments need; Nous Research has not reviewed and does not endorse it, and this is not a partnership. Everything below describes Hermes Agent itself — what it is a fork of — except the "Why this fork exists" and "Running this fork" sections, which are ours.
+
 **The self-improving AI agent built by [Nous Research](https://nousresearch.com).** It's the only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, searches its own past conversations, and builds a deepening model of who you are across sessions. Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearly nothing when idle. It's not tied to your laptop — talk to it from Telegram while it works on a cloud VM.
 
 Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenRouter, OpenAI, your own endpoint, and [many others](https://hermes-agent.nousresearch.com/docs/integrations/providers). Switch with `hermes model` — no code changes, no lock-in.
@@ -32,7 +42,66 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 
 ---
 
+## Why this fork exists
+
+FullStack Studio runs a Hermes gateway per customer, and a handful of things needed for that were not something upstream had taken yet:
+
+- **A bot knows who it's talking to.** The gateway binds the signed-in dashboard user into the session, instead of leaving the model to treat everyone as unidentified.
+- **A session stays in the right sandbox.** The session's profile is bound alongside the user, so a multi-profile dashboard can't mix up two customers' containers.
+- **Memory stays inside a profile, with an optional shared layer.** Each profile's memories are its own; a deployment can also configure one shared layer that every profile may read, and write to only when a turn explicitly asks to.
+- **A busy agent's message gets retried.** A delivery that only failed because the recipient was mid-turn is retried instead of silently dropped.
+- **A dashboard dependency fix.** Two dashboard dependencies flagged as vulnerable are pinned to patched versions.
+
+Every change is one commit with a reason, tracked in [`FORK.md`](FORK.md) — including which of them have been offered back upstream. Anything upstream ends up adopting is dropped from the fork.
+
+---
+
+## Running this fork
+
+The one-line installers below (`Quick Install`) are Nous Research's own hosted scripts, and they always install **upstream** Hermes Agent: the repository URL is hardcoded inside `scripts/install.sh` / `scripts/install.ps1` (`REPO_URL_HTTPS` / `$RepoUrlHttps`, both pointing at `NousResearch/hermes-agent`), and the installers' `--branch` flag only picks a branch of that same upstream repository — there's no flag that redirects the clone to a fork. That's true for this fork or any other.
+
+To run **this fork** instead, clone it directly and install the same way the installer does under the hood — same dependency step, same `hermes` command:
+
+```bash
+git clone --branch fss https://github.com/fullstackstudio-nl/hermes-agent.git
+cd hermes-agent
+
+# if you don't already have uv:
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+uv venv ~/.hermes/venvs/hermes-fss --python 3.11
+source ~/.hermes/venvs/hermes-fss/bin/activate
+uv pip install -e ".[all]"
+
+hermes              # start chatting
+```
+
+On Windows, clone with `git clone --branch fss https://github.com/fullstackstudio-nl/hermes-agent.git` (PowerShell or Git Bash both work), then follow the same `uv venv` / `uv pip install -e ".[all]"` steps — the same limitation applies to `scripts/install.ps1`.
+
+Because this clones from `fullstackstudio-nl/hermes-agent` directly, `git remote -v` shows this fork as `origin`, and `hermes update` — which pulls from whatever `origin` the install was cloned from, on whatever branch is checked out — stays on `fss` on its own. No extra configuration is needed to keep `hermes update` pointed at the fork once you've installed it this way.
+
+If you actually want plain upstream Hermes Agent rather than this fork, the `Quick Install` one-liners below work as documented in [the upstream repository](https://github.com/NousResearch/hermes-agent).
+
+### Keeping this fork up to date
+
+- `main` in `fullstackstudio-nl/hermes-agent` mirrors upstream `main` and is never committed to directly.
+- `fss` carries FullStack Studio's changes, rebased (or merged) onto `main` as upstream moves — see [`FORK.md`](FORK.md) for the full policy and the list of what's carried.
+- Upstream is fetched regularly so `fss` doesn't drift far behind; a small delta is what keeps rebasing cheap.
+
+### Memory layer settings
+
+This fork's memory changes (see [`FORK.md`](FORK.md)) add one optional setting for a deployment that wants a memory layer shared across profiles:
+
+- `MEM0_SHARED_AGENT_ID` (or `shared_agent_id` in a profile's `mem0.json`) names that shared layer. Set it per profile in that profile's own `.env` (`~/.hermes/profiles/<profile>/.env`, or `~/.hermes/.env` for the default profile) — it is not read from the gateway service's environment.
+- Writes to that layer are allowed by default once it's configured — configuring a layer is the opt-in. Set `MEM0_SHARED_WRITES=false` to make it a curated, read-only layer instead.
+
+Restart the gateway (or start a new session) after changing either setting — the value is read when the agent is built.
+
+---
+
 ## Quick Install
+
+> These one-liners install **upstream** Hermes Agent, not this fork — see [Running this fork](#running-this-fork) above for the fork's own install steps.
 
 ### Linux, macOS, WSL2, Termux
 
@@ -216,16 +285,15 @@ See `hermes claw migrate --help` for all options, or use the `openclaw-migration
 
 ## Contributing
 
-We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process.
+We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process — it's written against upstream, but the code style and PR process apply here too. Contributions to this fork's own changes go against `fss` in `fullstackstudio-nl/hermes-agent`, not upstream.
 
-Quick start for contributors — use the standard installer, then work from the
-full git checkout it creates at `$HERMES_HOME/hermes-agent` (usually
-`~/.hermes/hermes-agent`). This matches the layout used by `hermes update`, the
-managed venv, lazy dependencies, gateway, and docs tooling.
+Quick start for contributors to this fork — clone it directly (the hosted
+installer always pulls upstream, see [Running this fork](#running-this-fork)
+above), then work from that checkout:
 
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-cd "${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
+git clone --branch fss https://github.com/fullstackstudio-nl/hermes-agent.git
+cd hermes-agent
 uv pip install -e ".[all,dev]"
 scripts/run_tests.sh
 ```
