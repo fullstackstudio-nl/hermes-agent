@@ -47,16 +47,47 @@ def _session_client_answers_requests(sid: str) -> bool:
     return not clients or any(server_requests.answers_requests(peer) for peer in clients)
 
 
-def _warn_foreign_login(session: dict, transport) -> None:
+def _note_foreign_login(session: dict, transport) -> None:
     """Ownership is not enforced; a second login sharing a session is only logged, and the agent keeps the
-    creator's user id."""
+    creator's user id. The record is ALSO marked shared, for good: from here on ``auth_user_id`` is the
+    login that opened the conversation and not an answer to who is acting, so the session-identity vars
+    must fail closed (:func:`_session_identity_is_ambiguous`)."""
     attaching = _transport_auth_user_id(transport)
     if attaching is None:
         return
     creator = _session_auth_user_id(session)
     if creator != attaching:
+        session["auth_user_shared"] = True
         logger.warning("Session %s keeps the user id %s it was created with; a client logged in as %s attached",
                        session.get("session_key"), creator or "(none)", attaching)
+
+
+def _session_auth_logins(session: dict | None) -> set[str]:
+    """Every distinct signed-in login attached to *session*'s transport slot right now."""
+    return {login for peer in _session_live_transports(session)
+            if (login := _transport_auth_user_id(peer)) is not None}
+
+
+def _session_identity_is_ambiguous(session: dict | None) -> bool:
+    """Whether more than one signed-in person could be behind this session's work.
+
+    ``auth_user_id`` names the login the record was CREATED under, and nothing re-stamps it when a second
+    window attaches, so on a shared session the stamp is not proof of who is acting. Two things make it
+    unprovable and both count: ``auth_user_shared``, set once by :func:`_note_foreign_login` and never
+    unset (the second person leaving does not turn the creator's stamp back into proof of who typed what
+    while they were there), and a slot that right now carries a login the stamp does not name — a peer
+    that reached it without passing through this module.
+
+    A slot naming no login at all is NOT ambiguous: a parked session, a stdio peer and the compute-host
+    child's own pipe have no competing person attached, so the stamp is the one identity in play."""
+    session = session or {}
+    if session.get("auth_user_shared"):
+        return True
+    logins = _session_auth_logins(session)
+    if not logins:
+        return False
+    creator = _session_auth_user_id(session)
+    return len(logins) > 1 or (creator is not None and logins != {creator})
 
 
 def _attach_session_transport(session: dict | None, transport) -> bool:
@@ -83,10 +114,10 @@ def _attach_session_transport(session: dict | None, transport) -> bool:
             return True
         if isinstance(existing, FanoutTransport):
             if not existing.contains(transport):
-                _warn_foreign_login(session, transport)
+                _note_foreign_login(session, transport)
             existing.attach(transport)
             return existing.contains(transport)
-        _warn_foreign_login(session, transport)
+        _note_foreign_login(session, transport)
         if _transport_is_live_peer(existing):
             session["transport"] = FanoutTransport(existing, transport)
         else:

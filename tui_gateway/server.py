@@ -1281,6 +1281,13 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             # background-watcher fields) names the person the agent itself was built for. An ungated
             # gateway (and the PTY child's server-internal credential) names no login: both stay "".
             user_id, display_name = _session_auth_user(sess)
+            # FAIL CLOSED on a session more than one signed-in person could be behind. The stamp names the
+            # login the record was CREATED under, which on a shared session is not the person acting, and
+            # every reader takes a bound name as verified: a wrong one attributes work to someone who never
+            # did it and answers a per-person authorisation check with the wrong human. Empty is a state
+            # they all already handle — an ungated gateway binds it on every turn — so bind that instead.
+            if _session_identity_is_ambiguous(sess):
+                user_id, display_name = None, ""
             user_id = user_id or ""
             # The person's own name when the login carried one (the OIDC ``name`` claim, verified with the
             # login itself and minted into the WS credential beside it) — never a lookup on this path, and
