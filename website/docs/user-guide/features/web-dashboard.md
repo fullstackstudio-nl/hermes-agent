@@ -848,9 +848,11 @@ The provider verifies the OpenID Connect **ID token** (RS256/ES256) against the 
 | Session field | Claim(s) |
 |---------------|----------|
 | `user_id` | `sub` (required) |
-| `email` | `email` |
-| `display_name` | `name` → `preferred_username` → `nickname` → `email` |
+| `email` | `email`, dropped when the token says `email_verified: false` |
+| `display_name` | `name` → `preferred_username` → `nickname` → the kept `email` |
 | `org_id` | `org_id` / `organization`, else joined `groups` |
+
+A `picture` claim is fetched once at sign-in and stored by the dashboard, which then serves its own copy at `GET /api/auth/picture?id=<provider>:<sub>` to signed-in users (`/api/auth/me` returns it as `picture_url`). Only an `https` image on port 443 and a public address is fetched -- PNG, JPEG, WebP or GIF, at most 512 KB and 4096×4096 pixels, within 10 seconds; anything else leaves the user without a picture and never fails the sign-in. Only the ID token is read: a provider that puts `email` or `picture` only in its userinfo response gives the dashboard neither.
 
 The ID token is what establishes identity — the access token is treated as opaque (the OIDC spec does not require it to be a JWT). Endpoint URLs are required to be HTTPS (loopback `http://` is allowed for local-dev IDPs), and the discovery document's advertised `issuer` must match your configured one (a trailing-slash difference is tolerated). Refresh tokens, when the IDP issues them, are used for silent re-auth via the standard `refresh_token` grant; logout calls the IDP's RFC 7009 `revocation_endpoint` when advertised.
 

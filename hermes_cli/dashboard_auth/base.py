@@ -2,14 +2,20 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
 @dataclass(frozen=True)
 class Session:
     """A verified interactive identity (from ``complete_login`` / ``verify_session``). All fields
-    mandatory; providers without orgs set ``org_id=""``. The tokens are opaque to Hermes."""
+    but ``picture`` mandatory; providers without orgs set ``org_id=""``. The tokens are opaque to
+    Hermes.
+
+    ``picture`` is the profile-picture URL the provider asserted in the verified token, ``""`` when
+    it sent none. It is an input for the login-time fetch (``dashboard_auth.pictures``) and nothing
+    else: it is never serialised to a client, because a client loading it directly would tell the
+    provider whose conversation it is looking at. Kept out of ``repr`` so it never reaches a log."""
     user_id: str
     email: str
     display_name: str
@@ -18,6 +24,7 @@ class Session:
     expires_at: int  # unix seconds; the access_token's exp claim
     access_token: str
     refresh_token: str
+    picture: str = field(default="", repr=False)
 
 
 @dataclass(frozen=True)

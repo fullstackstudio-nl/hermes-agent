@@ -167,14 +167,16 @@ def refresh_token_from(payload: Dict[str, Any], fallback: str = "") -> str:
 
 def session_from_claims(
     provider: str, claims: Dict[str, Any], *, access_token: str, refresh_token: str,
-    label: str = "token", email: str = "", display_name: str = "", org_id: str = "") -> Session:
+    label: str = "token", email: str = "", display_name: str = "", org_id: str = "",
+    picture: str = "") -> Session:
     """Map verified JWT claims onto a Session; ``sub`` is mandatory."""
     user_id = str(claims.get("sub", ""))
     if not user_id:
         raise ProviderError(f"{label} missing 'sub' (user_id) claim")
     return Session(
         user_id=user_id, email=email, display_name=display_name, org_id=org_id, provider=provider,
-        expires_at=int(claims["exp"]), access_token=access_token, refresh_token=refresh_token)
+        expires_at=int(claims["exp"]), access_token=access_token, refresh_token=refresh_token,
+        picture=picture)
 
 
 # ---- JWT verification ----

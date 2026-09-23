@@ -745,6 +745,50 @@ class TestVerifySession:
         )
 
 
+class TestProfileClaims:
+    """Email and picture are taken only as the provider asserts them in the verified ID token.
+    Nothing is derived: an email the provider says is unverified is dropped, and it may not
+    come back in through the display-name fallback either."""
+
+    @pytest.fixture
+    def provider(self, rsa_keypair):
+        return _make_provider(rsa_keypair)
+
+    def _session(self, provider, rsa_keypair, **kwargs):
+        return provider.verify_session(access_token=_mint_id_token(rsa_keypair, **kwargs))
+
+    def test_email_and_picture_present(self, provider, rsa_keypair):
+        session = self._session(
+            provider, rsa_keypair, email="sam@example.org", extra_claims={
+                "email_verified": True, "picture": "https://avatars.example.org/sam.png"})
+        assert session.email == "sam@example.org"
+        assert session.picture == "https://avatars.example.org/sam.png"
+
+    @pytest.mark.parametrize("flag", [False, "false", "FALSE"])
+    def test_unverified_email_is_dropped(self, provider, rsa_keypair, flag):
+        session = self._session(
+            provider, rsa_keypair, email="sam@example.org", name=None,
+            extra_claims={"email_verified": flag})
+        assert session.email == ""
+        # The dropped address must not resurface as the name.
+        assert "sam@example.org" not in session.display_name
+
+    def test_email_without_verified_claim_is_kept(self, provider, rsa_keypair):
+        session = self._session(provider, rsa_keypair, email="sam@example.org", name=None)
+        assert session.email == "sam@example.org"
+        assert session.display_name == "sam@example.org"
+
+    @pytest.mark.parametrize("claims", [{}, {"picture": ""}, {"picture": 42}, {"picture": None}])
+    def test_no_usable_picture_claim_means_no_picture(self, provider, rsa_keypair, claims):
+        session = self._session(provider, rsa_keypair, extra_claims=claims)
+        assert session.picture == ""
+
+    def test_picture_url_never_in_repr(self, provider, rsa_keypair):
+        session = self._session(
+            provider, rsa_keypair, extra_claims={"picture": "https://avatars.example.org/sam.png"})
+        assert "avatars.example.org" not in repr(session)
+
+
 # ---------------------------------------------------------------------------
 # refresh_session + revoke_session
 # ---------------------------------------------------------------------------

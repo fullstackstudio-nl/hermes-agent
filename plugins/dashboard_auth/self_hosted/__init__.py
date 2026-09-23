@@ -258,8 +258,15 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
     def _session(self, id_token: str, refresh_token: str, claims: Dict[str, Any]) -> Session:
         """Map verified OIDC claims onto a Session. The verified ID token is stored in
         ``Session.access_token`` so the per-request ``verify_session`` re-verifies a real
-        JWT; the opaque OAuth access token is not kept — the dashboard only needs identity."""
-        email = str(claims.get("email", "") or "")
+        JWT; the opaque OAuth access token is not kept — the dashboard only needs identity.
+
+        Email and picture are only what the ID token asserts. An email the provider marks
+        ``email_verified: false`` is dropped here, before anything can read it -- including the
+        display-name fallback below. Claims a provider sends only from userinfo are not seen:
+        the session is rebuilt from this token on every request, which is what keeps the gate
+        free of server-side session state."""
+        email = _verified_email(claims)
+        picture = claims.get("picture")
         # Org/tenant is non-standard: accept common spellings, else join ``groups`` so
         # multi-tenant IDPs surface *something* (free-form string).
         org_id = claims.get("org_id") or claims.get("organization") or ""
@@ -269,7 +276,17 @@ class SelfHostedOIDCProvider(JwtOAuthProvider):
         return session_from_claims(
             self.name, claims, access_token=id_token, refresh_token=refresh_token, label="ID token", email=email,
             display_name=str(claims.get("name") or claims.get("preferred_username") or claims.get("nickname") or email or ""),
-            org_id=str(org_id or ""))
+            org_id=str(org_id or ""), picture=picture if isinstance(picture, str) else "")
+
+
+def _verified_email(claims: Dict[str, Any]) -> str:
+    """The ``email`` claim, or ``""`` when the provider says it is unverified. Some providers send
+    ``email_verified`` as the string ``"false"``; an absent flag keeps the address, since the
+    provider asserted it and did not say otherwise."""
+    flag = claims.get("email_verified")
+    if flag is False or (isinstance(flag, str) and flag.strip().lower() == "false"):
+        return ""
+    return str(claims.get("email", "") or "")
 
 
 # ---- Plugin entry point ----

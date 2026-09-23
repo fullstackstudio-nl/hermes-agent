@@ -13,6 +13,7 @@ allowlists the public ones.
   POST /auth/native/refresh    desktop-held refresh token rotation
   GET  /api/auth/providers     list registered providers (login bootstrap)
   GET  /api/auth/me            current Session as JSON (auth-required)
+  GET  /api/auth/picture?id=   a signed-in user's stored profile picture (auth-required)
   POST /api/auth/ws-ticket     single-use WS upgrade ticket (auth-required)
 """
 from __future__ import annotations
@@ -24,13 +25,13 @@ from collections import defaultdict, deque
 from typing import Any, Deque, Dict
 from urllib.parse import quote, unquote, urlencode, urlparse, urlunparse
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from hermes_cli.dashboard_auth import (
-    get_provider, list_providers, list_session_providers, native_flow)
+    get_provider, list_providers, list_session_providers, native_flow, pictures)
 from hermes_cli.dashboard_auth import prefix as _prefix_mod
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import (
@@ -141,15 +142,24 @@ def _login_success(request: Request, session: Session, provider: str) -> None:
            email=session.email, org_id=session.org_id)
 
 
-def _complete_login(request: Request, provider: str, session: Session, *, broker_state: str,
-                    next_raw: str) -> tuple:
+async def _complete_login(request: Request, provider: str, session: Session, *, broker_state: str,
+                          next_raw: str) -> tuple:
     """Shared tail of the callback + password routes after credentials verified: audit success,
-    then either the native loopback redirect (no cookies) or the landing path. Returns
-    ``(target_url, native)``."""
+    then either the native loopback redirect (no cookies) or the landing path, storing the profile
+    picture this login brought. Returns ``(target_url, native)``.
+
+    The picture is fetched here and nowhere else -- not in the provider's grant, which refresh
+    shares -- so it happens once per sign-in, and only once the login is certain to complete: a
+    native login whose pending authorization is gone fails first and leaves the stored picture
+    alone. The login never waits for a fetch slot and waits for the fetch itself only so long (see
+    ``pictures.store_login_picture``); it never raises."""
     _login_success(request, session, provider)
     if broker_state:
-        return _finish_native_login(
-            request, broker_state=broker_state, session=session, provider=provider), True
+        target = _finish_native_login(
+            request, broker_state=broker_state, session=session, provider=provider)
+        await pictures.store_login_picture(session)
+        return target, True
+    await pictures.store_login_picture(session)
     return _validate_post_login_target(next_raw) or "/", False
 
 
@@ -318,7 +328,7 @@ async def auth_callback(
     except ProviderError as e:
         _login_failure(request, provider_name, "provider_unreachable")
         raise _http(503, f"Provider unreachable: {e}")
-    target, native = _complete_login(
+    target, native = await _complete_login(
         request, provider_name, session, broker_state=parts.get("broker", ""),
         next_raw=parts.get("next", ""))
     resp = RedirectResponse(url=target, status_code=302)
@@ -408,7 +418,7 @@ async def auth_password_login(request: Request, body: _PasswordLoginBody):
     except ProviderError as e:
         _login_failure(request, body.provider, "provider_unreachable")
         raise _http(503, f"Provider unreachable: {e}")
-    target, native = _complete_login(
+    target, native = await _complete_login(
         request, body.provider, session, broker_state=broker_state, next_raw=body.next)
     resp = JSONResponse({"ok": True, "next": target})
     if native:
@@ -448,11 +458,37 @@ def _require_session(request: Request):
 
 @router.get("/api/auth/me", name="auth_me")
 async def api_auth_me(request: Request):
-    """Return the verified session as JSON. Auth-required (gate enforces)."""
+    """Return the verified session as JSON. Auth-required (gate enforces).
+
+    Everything here comes from the session the gateway verified, never from the request.
+    ``picture_url`` is the gateway's own copy (see ``pictures``), present only while one is stored;
+    the provider's URL is never handed out."""
     sess = _require_session(request)
-    return {
+    body = {
         "user_id": sess.user_id, "email": sess.email, "display_name": sess.display_name,
         "org_id": sess.org_id, "provider": sess.provider, "expires_at": sess.expires_at}
+    identity = pictures.identity_id(sess.provider, sess.user_id)
+    if pictures.has_picture(identity):
+        body["picture_url"] = pictures.picture_path(identity)
+    return body
+
+
+@router.get(pictures.PICTURE_ENDPOINT, name="auth_picture")
+async def api_auth_picture(request: Request, identity: str = Query("", alias="id")):
+    """The stored profile picture of ``id`` (``<provider>:<user id>``, the author-stamp id) for any
+    signed-in user of this gateway -- a colleague's included, which is deliberate.
+
+    Every id without a stored picture gets the same 404 as an unknown route, so this cannot tell a
+    caller which ids exist. The type is the one read from the stored bytes, ``nosniff`` keeps a
+    browser from second-guessing it, and the sandboxing CSP keeps it inert if opened directly."""
+    _require_session(request)
+    found = await run_in_threadpool(pictures.read_picture, identity)
+    if found is None:
+        raise _http(404, "Not Found")
+    data, kind = found
+    return Response(content=data, media_type=kind, headers={
+        "X-Content-Type-Options": "nosniff", "Cache-Control": "private, no-cache",
+        "Content-Security-Policy": "default-src 'none'; sandbox"})
 
 
 @router.post("/api/auth/ws-ticket", name="auth_ws_ticket")
