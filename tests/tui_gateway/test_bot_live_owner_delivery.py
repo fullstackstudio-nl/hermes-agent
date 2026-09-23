@@ -13,7 +13,7 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
     import contextvars
     import logging
     import time
-    from tui_gateway import prompt_turn
+    from tui_gateway import prompt_turn, server
     from tui_gateway.session_lifecycle import _start_session_work
     from tools import bot_live_delivery as mailbox
 
@@ -33,6 +33,9 @@ def test_refused_input_commits_failed_mailbox_receipt(tmp_path):
         "_session_profile_runtime_scope": lambda session: contextlib.nullcontext(),
         "_emit": noop, "bind_transport": noop, "reset_transport": noop,
         "_current_runtime_session_record": contextvars.ContextVar("refused_turn"),
+        # The turn binds who submitted it for its whole thread (server._acting_auth_user).
+        "_turn_auth_user": contextvars.ContextVar("refused_turn_auth_user", default=None),
+        "_UNATTRIBUTED_TURN": server._UNATTRIBUTED_TURN,
         "_TurnRun": prompt_turn._TurnRun,
         "_record_turn_marker": lambda *args, **kwargs: "marker",
         "_prepare_turn_input": lambda *args: None,

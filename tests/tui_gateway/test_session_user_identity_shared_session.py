@@ -41,12 +41,25 @@ class _FakeAgent:
         self.session_id = session_id
 
 
+class _Peer:
+    """A live client peer carrying a server-minted WS identity. Identity-hashed
+    like the real WSTransport: the session keeps its peers in a viewers dict."""
+
+    def __init__(self, auth_identity):
+        self.auth_identity = auth_identity
+
+    def write(self, obj):
+        return True
+
+    def close(self):
+        return None
+
+
 def _peer(provider, user_id, user_name=None):
-    """A live client peer carrying a server-minted WS identity."""
     identity = {"provider": provider, "user_id": user_id}
     if user_name is not None:
         identity["user_name"] = user_name
-    return types.SimpleNamespace(auth_identity=identity)
+    return _Peer(identity)
 
 
 def _install_session(monkeypatch, *, session_key, transport=None, **extra):
@@ -159,3 +172,194 @@ def test_an_unattributable_slot_login_binds_nothing(monkeypatch):
     )
 
     assert _bound("skey-unmarked") == ("", "", "")
+
+
+# ---------------------------------------------------------------------------
+# Who submitted this turn
+# ---------------------------------------------------------------------------
+#
+# Failing closed keeps a shared session from naming the wrong person, but it
+# names nobody. The answer the gateway does have is the connection the prompt
+# arrived on: WSTransport.auth_identity is minted at the WS upgrade from a
+# verified ticket and no RPC param can reach it. prompt.submit runs on that
+# connection's own context, so the identity is read there and carried into the
+# turn -- the turn thread itself sees only session["transport"], which on a
+# shared session is a FanoutTransport naming nobody.
+
+
+class _RecordingAgent:
+    """Fake agent that reads the bound identity from inside the running turn."""
+
+    def __init__(self, seen: list):
+        self._seen = seen
+        self._session_messages = []
+        self._last_flushed_db_idx = 0
+        self._db_flush_scan_prefix = []
+        self.session_id = "20260921_cafebabe"
+
+    def clear_interrupt(self):
+        return None
+
+    def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kw):
+        self._seen.append((
+            get_session_env("HERMES_SESSION_USER_ID"),
+            get_session_env("HERMES_SESSION_USER_ID_ALT"),
+            get_session_env("HERMES_SESSION_USER_NAME"),
+        ))
+        return {"final_response": "done"}
+
+
+class _InlineThread:
+    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
+        self._run = lambda: target(*args, **(kwargs or {}))
+
+    def start(self):
+        self._run()
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        return None
+
+
+@pytest.fixture()
+def shared_room(tmp_path, monkeypatch):
+    """A live session two signed-in people are attached to, wired for a real
+    prompt.submit -> turn run. Returns (sid, session, creator, joiner, seen)."""
+    from hermes_state import SessionDB
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("shared-room", source="desktop")
+    seen: list = []
+    creator, joiner = _peer("oidc", "user-a", "Robin"), _peer("oidc", "user-b", "Sam")
+    session = {
+        "agent": _RecordingAgent(seen), "attached_images": [], "cols": 80, "cwd": str(tmp_path),
+        "history": [], "history_lock": __import__("threading").Lock(), "history_version": 0,
+        "inflight_turn": None, "running": False, "session_key": "shared-room",
+        "show_reasoning": False, "slash_worker": None, "source": "desktop",
+        "tool_progress_mode": "all", "transport": creator,
+        "auth_user_id": "oidc:user-a", "auth_user_name": "Robin",
+    }
+    monkeypatch.setattr(server, "_db", db, raising=False)
+    monkeypatch.setattr(server, "_sessions", {"shared-sid": session}, raising=False)
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+    monkeypatch.setattr(server, "render_message", lambda *_a: "")
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    # The joiner opens the same conversation: the slot becomes a fanout naming nobody.
+    server._attach_session_transport(session, joiner)
+    assert session["auth_user_shared"] is True
+
+    def submit(peer, **params):
+        token = bind_transport(peer)
+        try:
+            return server._methods["prompt.submit"](
+                "rid", {"session_id": "shared-sid", "text": "who am i", **params})
+        finally:
+            reset_transport(token)
+
+    yield submit, session, creator, joiner, seen
+    db.close()
+
+
+def test_the_turn_names_the_member_who_submitted_it(shared_room):
+    """The reported scenario, end to end: both are attached, the JOINER sends
+    the prompt, and the turn runs as the joiner -- not as whoever opened the
+    conversation and not as nobody."""
+    submit, _session, _creator, joiner, seen = shared_room
+
+    assert submit(joiner)["result"]["status"] == "streaming"
+    assert seen == [("oidc:user-b", "", "Sam")]
+
+
+def test_the_creator_submitting_the_same_session_is_still_the_creator(shared_room):
+    """It follows the submitting connection, not the newest one: the same shared
+    session, a prompt from the person who opened it, runs as them."""
+    submit, _session, creator, _joiner, seen = shared_room
+
+    submit(creator)
+    assert seen == [("oidc:user-a", "", "Robin")]
+
+
+def test_a_client_cannot_name_itself_in_the_prompt(shared_room):
+    """Server-minted end to end. The identity comes from the connection's own
+    upgrade credential; params are the client's words and reach nothing."""
+    submit, _session, _creator, joiner, seen = shared_room
+
+    submit(joiner, user_id="oidc:user-a", user_name="Robin",
+           auth_user_id="oidc:user-a", auth_user_name="Robin")
+    assert seen == [("oidc:user-b", "", "Sam")]
+
+
+def test_a_submitter_with_no_login_falls_back_to_the_record(shared_room):
+    """stdio, the legacy token and the PTY child's internal credential name no
+    person. They must not clear a single-user session's identity, and on this
+    shared one there is still nothing to assert."""
+    submit, _session, _creator, _joiner, seen = shared_room
+
+    submit(None)
+    assert seen == [("", "", "")]
+
+
+def test_a_queued_prompt_keeps_its_own_submitter(monkeypatch):
+    """A prompt sent while the session is busy runs a turn of its own later. It
+    carries the connection that sent it, the way it already carries the socket
+    the reply streams to -- the drain must not attribute it to whoever the
+    session was last used by."""
+    session = {"queued_prompt": None, "queued_prompts": []}
+    server._enqueue_prompt(session, "later", _peer("oidc", "user-b"),
+                           turn_auth_user=("oidc:user-b", "Sam"))
+
+    assert session["queued_prompt"]["turn_auth_user"] == ("oidc:user-b", "Sam")
+
+
+def test_two_members_queued_prompts_are_not_merged(monkeypatch):
+    """Consecutive text-only prompts share one envelope so the model reads them
+    as one message. Two PEOPLE's prompts may not: the merged turn could only be
+    attributed to one of them."""
+    session = {"queued_prompt": None, "queued_prompts": []}
+    server._enqueue_prompt(session, "mine", _peer("oidc", "user-a"),
+                           turn_auth_user=("oidc:user-a", "Robin"))
+    server._enqueue_prompt(session, "and mine", _peer("oidc", "user-b"),
+                           turn_auth_user=("oidc:user-b", "Sam"))
+
+    assert session["queued_prompt"]["text"] == "mine"
+    assert [q["text"] for q in session["queued_prompts"]] == ["and mine"]
+
+
+def test_the_compute_host_frame_carries_the_submitter(monkeypatch):
+    """An isolated turn is built in a child process from this frame alone, so
+    the submitter has to travel in it -- the child's own pipe names nobody."""
+    import threading as _threading
+
+    sess = _install_session(
+        monkeypatch, session_key="skey-isolated",
+        transport=FanoutTransport(_peer("oidc", "user-a"), _peer("oidc", "user-b")),
+        auth_user_id="oidc:user-a", auth_user_name="Robin", auth_user_shared=True,
+        history=[], history_version=0, history_lock=_threading.Lock(), cols=80,
+    )
+
+    frame = server._compute_host_turn_frame(
+        "rid", "sid", sess, "who am i", turn_auth_user=("oidc:user-b", "Sam"))
+
+    assert (frame["auth_user_id"], frame["auth_user_name"]) == ("oidc:user-b", "Sam")
+
+
+def test_an_isolated_turn_with_no_submitter_still_fails_closed(monkeypatch):
+    """And without one it falls back to the same fail-closed record rule rather
+    than shipping the creator's login to the child."""
+    import threading as _threading
+
+    sess = _install_session(
+        monkeypatch, session_key="skey-isolated-open",
+        transport=FanoutTransport(_peer("oidc", "user-a"), _peer("oidc", "user-b")),
+        auth_user_id="oidc:user-a", auth_user_name="Robin", auth_user_shared=True,
+        history=[], history_version=0, history_lock=_threading.Lock(), cols=80,
+    )
+
+    frame = server._compute_host_turn_frame("rid", "sid", sess, "who am i")
+
+    assert (frame["auth_user_id"], frame["auth_user_name"]) == (None, "")

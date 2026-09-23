@@ -65,7 +65,7 @@ def test_next_human_followup_is_outside_diagnostic_presentation_scope(turn_env, 
     agent = SimpleNamespace(session_id="session-key", clear_interrupt=lambda: None,
         run_conversation=lambda *a, **k: {"final_response": "diagnostic echo", "messages": []})
     session = _session(agent=agent, running=True)
-    def followups(*a):
+    def followups(*a, **k):
         server._emit("message.complete", "session", {"text": "next requested result"})
     monkeypatch.setattr(server, "_run_post_turn_followups", followups)
     server._run_prompt_submit("request", "session", session, "engine failure",

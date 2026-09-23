@@ -1276,18 +1276,13 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             # App-global backends multiplex profiles: prefer the live session's own home.
             profile = profile_name_for_home(sess.get("profile_home")) or profile
             session_id = getattr(sess.get("agent"), "session_id", None) or session_key
-            # The login this record was admitted under — the SAME value _make_agent passes as the agent's
-            # runtime user_id, so a tool attributing work to a user (kanban, send_message, cron job args,
-            # background-watcher fields) names the person the agent itself was built for. An ungated
-            # gateway (and the PTY child's server-internal credential) names no login: both stay "".
-            user_id, display_name = _session_auth_user(sess)
-            # FAIL CLOSED on a session more than one signed-in person could be behind. The stamp names the
-            # login the record was CREATED under, which on a shared session is not the person acting, and
-            # every reader takes a bound name as verified: a wrong one attributes work to someone who never
-            # did it and answers a per-person authorisation check with the wrong human. Empty is a state
-            # they all already handle — an ungated gateway binds it on every turn — so bind that instead.
-            if _session_identity_is_ambiguous(sess):
-                user_id, display_name = None, ""
+            # WHO ASKED — resolved per connection, not per session record, so a tool attributing work to a
+            # user (kanban, send_message, cron job args, background-watcher fields) and a per-person
+            # authorisation check name the human who submitted this turn rather than the one who opened the
+            # conversation. An ungated gateway (and the PTY child's server-internal credential) names no
+            # login, and neither does a session more than one signed-in person could be behind: both bind
+            # "" rather than a name nothing can question. See :func:`_acting_auth_user`.
+            user_id, display_name = _acting_auth_user(sess)
             user_id = user_id or ""
             # The person's own name when the login carried one (the OIDC ``name`` claim, verified with the
             # login itself and minted into the WS credential beside it) — never a lookup on this path, and
@@ -2411,6 +2406,53 @@ def _session_auth_user(session: dict | None) -> tuple[str | None, str]:
 def _session_auth_user_id(session: dict | None) -> str | None:
     """The login half of :func:`_session_auth_user` — the value ``_make_agent`` builds the agent with."""
     return _session_auth_user(session)[0]
+
+
+#: A turn no signed-in connection submitted: a crash continuation, a wake-up, a cron run, a bot
+#: delivery, an isolated child's relayed turn. Distinct from "not inside a turn", which is what the
+#: unset ContextVar below means.
+_UNATTRIBUTED_TURN: tuple[None, str] = (None, "")
+
+#: ``(login, display name)`` of the connection that submitted the RUNNING turn, bound by
+#: ``_run_prompt_submit`` for the whole turn thread. The turn cannot read it off the transport itself:
+#: ``run_body`` binds the SESSION's slot there, which is a FanoutTransport as soon as a second client
+#: attaches, and a fanout carries no ``auth_identity``. Minted only from a WS-upgrade credential the
+#: server verified — RPC params can never populate it.
+_turn_auth_user: contextvars.ContextVar[tuple[str | None, str] | None] = contextvars.ContextVar(
+    "hermes_gateway_turn_auth_user", default=None)
+
+
+def _submitting_auth_user() -> tuple[str, str] | None:
+    """The signed-in identity of the connection handling THIS request, or None when it names no login
+    (stdio, the legacy token, the PTY child's server-internal credential, an internal caller with no
+    transport bound). Only meaningful on a request thread — a turn thread's bound transport is the
+    session's slot, not the submitter's socket."""
+    user_id, user_name = _transport_auth_user(current_transport())
+    return (user_id, user_name) if user_id is not None else None
+
+
+def _acting_auth_user(session: dict | None) -> tuple[str | None, str]:
+    """``(login, display name)`` this gateway may attribute work on ``session`` to right now.
+
+    Per CONNECTION first, because that is the only thing that answers "who asked": the turn's own
+    submitter when one was carried into it, otherwise the connection handling this request. Both are
+    read from a WS-upgrade credential the server minted and verified, never from RPC params and never
+    from a field a page could set.
+
+    The record's ``auth_user_id`` is the last resort. It names the login the session was CREATED under,
+    so it only answers where no second person could be behind the work (``_session_identity_is_ambiguous``)
+    — otherwise nobody is named at all. A live peer is proof someone is watching, never proof they asked,
+    so a turn that names no submitter does not fall back to the slot."""
+    acting = _turn_auth_user.get()
+    if acting is None:
+        acting = _submitting_auth_user()
+    elif acting is _UNATTRIBUTED_TURN:
+        acting = None
+    if acting is not None:
+        return acting
+    if _session_identity_is_ambiguous(session):
+        return None, ""
+    return _session_auth_user(session)
 
 
 def _make_agent(

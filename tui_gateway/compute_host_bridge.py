@@ -50,14 +50,17 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
 def _compute_host_turn_frame(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None, display_kind: str | None = None,
-    display_metadata: dict | None = None) -> dict:
+    display_metadata: dict | None = None, turn_auth_user: tuple[str, str] | None = None) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
         attached_images = list(image_paths if image_paths is not None else session.get("attached_images", []))
-    # The host pipe names no login of its own, so the gateway ships the record's login and the display
-    # name stamped with it as one pair; a peer that predates the name field simply sends none.
-    auth_user_id, auth_user_name = _session_auth_user(session)
+    # The host pipe names no login of its own, so the gateway ships the identity this turn may be
+    # attributed to -- the submitting connection's where one was carried in, else the record's own stamp
+    # where nothing contradicts it -- and the display name that belongs to that same login, as one pair.
+    # The child builds its agent from this frame alone, so an identity missing here is missing for the
+    # whole isolated turn; one that is wrong here is wrong with the gateway's own authority.
+    auth_user_id, auth_user_name = turn_auth_user or _acting_auth_user(session)
     return {
         "type": "turn.start", "sid": sid, "request_id": rid,
         "session_key": session.get("session_key") or sid, "text": text,
@@ -253,11 +256,12 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
 def _submit_prompt_to_compute_host(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None, display_kind: str | None = None,
-    display_metadata: dict | None = None) -> dict:
+    display_metadata: dict | None = None, turn_auth_user: tuple[str, str] | None = None) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(rid, sid, session, text, image_paths=image_paths,
                                      queued_prompt_generation=queued_prompt_generation,
-                                     display_kind=display_kind, display_metadata=display_metadata)
+                                     display_kind=display_kind, display_metadata=display_metadata,
+                                     turn_auth_user=turn_auth_user)
     # Caller JSON-RPC ids may repeat across sockets and turns. Use an opaque
     # dispatch lifetime token, installed before a fast child can send activity.
     turn_id = frame["turn_id"] = frame["request_id"] = uuid.uuid4().hex

@@ -413,12 +413,13 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
 
 
 def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str, *,
-                            on_done=None, on_error=None) -> None:
+                            on_done=None, on_error=None, turn_auth_user=None) -> None:
     """Chain one follow-up turn (caller set ``running``); on failure run ``on_error``, log,
-    release ``running``."""
+    release ``running``. The chained turn continues the work of whoever submitted the turn it follows,
+    so it is attributed to them and not re-resolved from the session record."""
     try:
         _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, prompt)
+        _run_prompt_submit(rid, sid, session, prompt, turn_auth_user=turn_auth_user)
         if on_done is not None:
             on_done()
     except Exception as exc:
@@ -430,7 +431,8 @@ def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str
 
 
 def _run_post_turn_followups(
-    rid, sid: str, session: dict, result: Any, goal_followup: str | None) -> None:
+    rid, sid: str, session: dict, result: Any, goal_followup: str | None, *,
+    turn_auth_user: tuple[str, str] | None = None) -> None:
     """Chain whatever should run after ``running`` was released.  Order: a mid-turn user
     prompt wins over every auto follow-up (drain it, skip the rest); a leftover /steer is
     requeued first so it isn't dropped; then goal continuation, then completion
@@ -438,7 +440,8 @@ def _run_post_turn_followups(
     steer = result.get("pending_steer") if isinstance(result, dict) else None
     if isinstance(steer, str) and steer.strip():
         with session["history_lock"]:
-            _enqueue_prompt(session, steer, session.get("transport"))
+            # The steer is that person's own words; requeue it under their identity, not the slot's.
+            _enqueue_prompt(session, steer, session.get("transport"), turn_auth_user=turn_auth_user)
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:
@@ -446,7 +449,8 @@ def _run_post_turn_followups(
             if not admitted or session.get("running"):
                 return  # user already sent something — their turn wins
             session["running"] = True
-        _dispatch_followup_turn(rid, sid, session, goal_followup, "goal continuation dispatch")
+        _dispatch_followup_turn(rid, sid, session, goal_followup, "goal continuation dispatch",
+                                turn_auth_user=turn_auth_user)
     # Safety net for completion events that arrived mid-turn.  Ownership is positive-proof
     # and compression-chain aware (same fail-closed gate as the poller): session B must
     # not consume session A's event.  Unclaimable events are requeued for the poller.
@@ -935,7 +939,8 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None) -> bool:
+    turn_author: dict | None = None,
+    turn_auth_user: tuple[str, str] | None = None) -> bool:
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -977,6 +982,12 @@ def _run_prompt_submit(
         # RPC-dispatcher ContextVars do not follow onto this thread: rebind the transport
         # before any tool can commission a child (delegate_task captures it as authority).
         transport_token = bind_transport(session.get("transport"))
+        # WHO ASKED, for the whole turn. It cannot be read off the transport bound above: that is the
+        # SESSION's slot, and a second attached client makes it a FanoutTransport, which carries no
+        # auth_identity at all. prompt.submit reads it on the submitting connection's own context and
+        # hands it down; a turn nobody submitted (crash continuation, wake-up, cron, bot delivery) binds
+        # the sentinel, so nothing downstream mistakes a watching peer for the person who asked.
+        auth_user_token = _turn_auth_user.set(turn_auth_user or _UNATTRIBUTED_TURN)
         runtime_session_token = _current_runtime_session_record.set(session)
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
@@ -1012,6 +1023,7 @@ def _run_prompt_submit(
         finally:
             _finish_turn(sid, session, st)
             _current_runtime_session_record.reset(runtime_session_token)
+            _turn_auth_user.reset(auth_user_token)
             reset_transport(transport_token)
             # A stale interim closure must not fire during a later turn.
             st.agent.interim_assistant_callback = None
@@ -1052,7 +1064,7 @@ def _run_prompt_submit(
         with notification_policy_snapshot(agent, "tui", notification_config), notification_turn(agent, muted=muted, session_id=sid):
             followup = run_body()
         if followup is not None:
-            _run_post_turn_followups(rid, sid, session, *followup)
+            _run_post_turn_followups(rid, sid, session, *followup, turn_auth_user=turn_auth_user)
     # The handle is resolved BEFORE _sessions_lock: a profile session opens its own SessionDB through the
     # state registry, and _sessions_lock gates every create/close/prompt on this backend.
     with _routing_provenance_db(session) as routing_db, _sessions_lock:
