@@ -16,11 +16,14 @@
   checkout that is on `main` and cannot fast-forward runs `git reset --hard origin/main` without
   tagging or stashing first. Merging keeps every update a fast-forward. Merge often; a small delta
   stays cheap.
-- Nothing that runs this fork commits to `main`. A local commit there is discarded by the reset path
-  above, with no prompt and no recovery tag — the updater only writes a rescue ref when the histories
-  share no ancestor at all. Work that belongs to one deployment goes on its own branch and is
-  installed with `hermes update --branch <name>`, which is the one case the updater merges instead of
-  resetting.
+- Nothing that runs this fork commits to `main`. A commit made on the branch an update targets is
+  discarded by that reset, with no prompt and no recovery tag: the updater writes a rescue ref only
+  when the two histories share no ancestor at all, and tags nothing otherwise. Naming the branch does
+  not help — the parked-branch guard returns early when the checkout is already on the target, so
+  `--branch <name>` while on `<name>` is the reset path too. Work that belongs to one deployment goes
+  on a branch of its own, left checked out, with `updates.parked_branch_strategy: update_in_place` in
+  that deployment's `config.yaml`. That is the one arrangement where the updater merges `origin/main`
+  into the branch rather than resetting, and the only one that tags the commit it merges from.
 - `fss` is held at the same commit as `main` while installs made from it move across. It is not a
   second line of development: it advances with `main` or not at all, and it is deleted once nothing
   is checked out on it.
