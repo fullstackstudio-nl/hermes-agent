@@ -213,6 +213,9 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "nous": "agent",
     "connections": "agent",
     "auth": "security",
+    # `profiles.max` is the only schema-surfaced profiles field; it caps profile creation, which is a
+    # gateway-wide operator setting, so it sits with the other general ones.
+    "profiles": "general",
     # `fallback.min_switch_reset_seconds` is the only schema-surfaced fallback field.
     "fallback": "agent",
 }
