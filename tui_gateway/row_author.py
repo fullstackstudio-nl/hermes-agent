@@ -41,8 +41,9 @@ def row_author(auth_user: tuple[str | None, str] | None) -> dict | None:
     upgrade from a verified ticket and carried into the turn by ``prompt.submit`` -- never a value
     any RPC parameter can reach. None where that connection names no login (stdio, the legacy
     token, the PTY child's server-internal credential), and the unattributed-turn sentinel a crash
-    continuation, a wake-up, a cron run or a bot delivery binds needs no special case here: it
-    names no login by construction, so the check below already refuses it.
+    continuation, a wake-up, a cron run, a bot delivery or an internally dispatched submit binds is
+    refused explicitly: it is a distinct object rather than a pair, so it cannot be unpacked, and
+    "nobody submitted this" must never read as a person.
 
     A session record's own ``auth_user_id`` is deliberately NOT a fallback. It names the login the
     conversation was created under, which is not evidence that its owner typed THIS message, and a
@@ -50,7 +51,7 @@ def row_author(auth_user: tuple[str | None, str] | None) -> dict | None:
 
     ``name`` is omitted rather than empty, because a reader falls back to its own directory or to
     the id, where an empty string would read as a person who has no name."""
-    if not auth_user:
+    if not auth_user or not isinstance(auth_user, tuple) or len(auth_user) != 2:
         return None
     user_id, user_name = auth_user
     if not user_id:
