@@ -941,6 +941,12 @@ def _run_prompt_submit(
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     turn_author: dict | None = None,
     turn_auth_user: tuple[str, str] | None = None) -> bool:
+    # WHO WROTE IT, for a turn that has to write its own user row: a prompt queued while the session
+    # was busy, or a submit whose submit-time write failed. prompt.submit already merged the author
+    # into the row it wrote, and merging again is the same value; a turn nobody submitted carries no
+    # identity here, so nothing is merged and its row names nobody.
+    from tui_gateway.row_author import with_row_author
+    display_metadata = with_row_author(display_metadata, turn_auth_user)
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by

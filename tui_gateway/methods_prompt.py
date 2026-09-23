@@ -444,7 +444,7 @@ def _storage_error_data(failure, raw) -> dict:
     return {"code": failure.code, "cause": failure.cause, "details": storage_failure_details(raw)}
 
 
-def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
+def _persist_session_row_for_submit(rid, session, text=None, display_kind=None, display_metadata=None):
     """Lazily persist the DB row now that the user sent a message (a branch becomes real
     here), then the message itself (#111868: a freeze during the first build must leave a
     resumable transcript); the error reply is the only user-visible signal (desktop maps it to a toast)."""
@@ -459,7 +459,7 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
                 data=_storage_error_data(failure, _db_error))
         else:
             _persist_branch_seed(session)
-            _persist_submit_user_row(session, text, display_kind)
+            _persist_submit_user_row(session, text, display_kind, display_metadata)
             return None
     except Exception as exc:
         failure = describe_storage_failure(exc)
@@ -599,6 +599,14 @@ def _(rid, params: dict) -> dict:
     # credential the server minted and verified for this socket -- the params above are the client's own
     # words, and they reach neither this value nor the author fence it sits beside.
     submitter = _submitting_auth_user()
+    # WHO WROTE IT, on the row itself. The live path cannot say: message.start carries no payload and
+    # two clients on one session share a FanoutTransport, so a client never learns from the socket
+    # that somebody else typed anything -- it reads the row back afterwards, by which time every live
+    # signal is gone. So the author is stamped where it can still be proven, from the same identity
+    # the turn is attributed to, and nowhere else. The params above are the client's own words and
+    # reach neither this value nor the key it lands under.
+    from tui_gateway.row_author import with_row_author
+    display_metadata = with_row_author(display_metadata, submitter)
     hosted_task = params.get("_hosted_task")
     hosted_terminal_callback = params.get("_hosted_terminal_callback")
     internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
@@ -690,7 +698,8 @@ def _(rid, params: dict) -> dict:
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s", sid,
             isolated_response["error"].get("message", "unknown error"))
-    if (err := _persist_session_row_for_submit(rid, session, text, display_kind)) is not None:
+    if (err := _persist_session_row_for_submit(
+            rid, session, text, display_kind, display_metadata)) is not None:
         return err
     # A completed FAILED build must not wedge the session: rebuild, don't replay it.
     if not _restart_completed_failed_agent_build(sid, session, session.get("agent_ready")):

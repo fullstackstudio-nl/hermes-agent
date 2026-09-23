@@ -345,13 +345,20 @@ def _persist_branch_seed(session: dict) -> None:
             _workdir_reraise_disk_full(exc, "branch seed persist failed")
 
 
-def _persist_submit_user_row(session: dict, text: Any, display_kind: str | None) -> None:
+def _persist_submit_user_row(
+        session: dict, text: Any, display_kind: str | None,
+        display_metadata: dict | None = None) -> None:
     """Write the submitted user turn at send time, before the agent build and turn: the agent's own
     crash persist only runs once the build finished, so quitting a frozen app during a slow first build
     left a session row with no message (#111868). The dict is staged on the session already stamped
     durable (the shape ``quiet_single_query`` re-stages an unanswered DM in) so the turn adopts it via
     ``_stage_turn_user_message`` and the flush writes no second row. A failed write stages nothing:
-    the turn's crash persist then writes the row as before."""
+    the turn's crash persist then writes the row as before.
+
+    ``display_metadata`` rides along because this IS the durable row for a submitted turn: the turn
+    adopts the dict staged here and the flush therefore never writes what ``_stage_turn_user_message``
+    put on it, so anything the row must carry (the turn's author) has to be written here or not at
+    all."""
     key = session.get("session_key")
     if not key or not isinstance(text, str) or not text.strip():
         return
@@ -360,12 +367,15 @@ def _persist_submit_user_row(session: dict, text: Any, display_kind: str | None)
     staged = stamp_message_timestamp({"role": "user", "content": text})
     if display_kind:
         staged["display_kind"] = display_kind
+    if display_metadata:
+        staged["display_metadata"] = display_metadata
     with _session_db(session) as db:
         if db is None:
             return
         try:
             staged["_row_id"] = db.append_message(
-                key, "user", content=text, display_kind=display_kind, timestamp=staged["timestamp"])
+                key, "user", content=text, display_kind=display_kind,
+                display_metadata=display_metadata or None, timestamp=staged["timestamp"])
         except Exception as exc:
             _workdir_reraise_disk_full(exc, "submit-time user row persist failed")
             return
