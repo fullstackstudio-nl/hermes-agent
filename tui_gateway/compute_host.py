@@ -21,6 +21,21 @@ from typing import Any, Callable, Collection
 from tui_gateway.host_supervisor import MUTATOR_ROUTE_TABLE, _build_sha
 
 
+def _frame_turn_auth_user(frame: dict[str, Any]) -> tuple[str | None, str] | None:
+    """WHO ASKED for this turn, as the GATEWAY resolved it, or None when the frame does not say.
+
+    This process cannot resolve it: its only peer is the host pipe, and its copy of the session record
+    reads as one unshared login whatever the gateway saw. So the answer travels in the frame, and a
+    present-but-EMPTY id is an answer -- "attributable to nobody" -- which must bind empty rather than
+    send the child back to the record. A parent that predates these keys sends neither and gets None,
+    which leaves the child's turn on the record exactly as before. The conversation's own login arrives
+    separately as ``auth_user_id`` and is what the agent (and so memory) is built with."""
+    if "turn_auth_user_id" not in frame:
+        return None
+    return (str(frame.get("turn_auth_user_id") or "") or None,
+            str(frame.get("turn_auth_user_name") or ""))
+
+
 def now_ns() -> int:
     return time.perf_counter_ns()
 
@@ -250,7 +265,8 @@ class ComputeHost:
             server._run_prompt_submit(
                 request_id, sid, session, text, display_kind=frame.get("display_kind") or None,
                 display_metadata=(frame.get("display_metadata")
-                                  if isinstance(frame.get("display_metadata"), dict) else None))
+                                  if isinstance(frame.get("display_metadata"), dict) else None),
+                turn_auth_user=_frame_turn_auth_user(frame))
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 while run_thread.is_alive():

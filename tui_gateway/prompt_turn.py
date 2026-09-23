@@ -985,23 +985,31 @@ def _run_prompt_submit(
         _emit("message.start", sid)
 
     def run_body():
-        # RPC-dispatcher ContextVars do not follow onto this thread: rebind the transport
-        # before any tool can commission a child (delegate_task captures it as authority).
-        transport_token = bind_transport(session.get("transport"))
-        # WHO ASKED, for the whole turn. It cannot be read off the transport bound above: that is the
-        # SESSION's slot, and a second attached client makes it a FanoutTransport, which carries no
-        # auth_identity at all. prompt.submit reads it on the submitting connection's own context and
-        # hands it down; a turn nobody submitted (crash continuation, wake-up, cron, bot delivery) binds
-        # the sentinel, so nothing downstream mistakes a watching peer for the person who asked.
-        auth_user_token = _turn_auth_user.set(turn_auth_user or _UNATTRIBUTED_TURN)
-        runtime_session_token = _current_runtime_session_record.set(session)
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None)
+        # Built before the try because the finally needs it; the marker write below touches the
+        # filesystem and can raise, so NOTHING is bound until we are inside the try.
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
             notification_category=(display_metadata or {}).get("notification_category"))
         goal_followup = None
+        # Every ContextVar this turn binds is bound INSIDE the try whose finally resets it, and each
+        # reset is guarded by its own token. A binding that escapes outlives the turn: this thread goes
+        # on to drain notifications and dispatch follow-ups, and a leaked transport is not merely stale
+        # bookkeeping -- ``_acting_auth_user`` reads the bound transport when no turn is in scope, so a
+        # leaked one makes later work name whoever that socket belonged to.
+        transport_token = auth_user_token = runtime_session_token = None
         try:
+            # RPC-dispatcher ContextVars do not follow onto this thread: rebind the transport
+            # before any tool can commission a child (delegate_task captures it as authority).
+            transport_token = bind_transport(session.get("transport"))
+            # WHO ASKED, for the whole turn. It cannot be read off the transport bound above: that is the
+            # SESSION's slot, and a second attached client makes it a FanoutTransport, which carries no
+            # auth_identity at all. prompt.submit reads it on the submitting connection's own context and
+            # hands it down; a turn nobody submitted (crash continuation, wake-up, cron, a relayed DM)
+            # binds the sentinel, so nothing downstream mistakes a watching peer for the person who asked.
+            auth_user_token = _turn_auth_user.set(turn_auth_user or _UNATTRIBUTED_TURN)
+            runtime_session_token = _current_runtime_session_record.set(session)
             prepared = _prepare_turn_input(sid, session, st, text, images)
             if prepared is None:
                 if st.terminal_callback is not None and not st.receipt_attempted:
@@ -1027,10 +1035,13 @@ def _run_prompt_submit(
         except Exception as e:
             _recover_turn_exception(sid, session, st, e)
         finally:
-            _finish_turn(sid, session, st)
-            _current_runtime_session_record.reset(runtime_session_token)
-            _turn_auth_user.reset(auth_user_token)
-            reset_transport(transport_token)
+            _finish_turn(sid, session, st)  # still inside every scope this turn bound
+            if runtime_session_token is not None:
+                _current_runtime_session_record.reset(runtime_session_token)
+            if auth_user_token is not None:
+                _turn_auth_user.reset(auth_user_token)
+            if transport_token is not None:
+                reset_transport(transport_token)
             # A stale interim closure must not fire during a later turn.
             st.agent.interim_assistant_callback = None
             with session["history_lock"]:

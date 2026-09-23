@@ -2408,10 +2408,13 @@ def _session_auth_user_id(session: dict | None) -> str | None:
     return _session_auth_user(session)[0]
 
 
-#: A turn no signed-in connection submitted: a crash continuation, a wake-up, a cron run, a bot
-#: delivery, an isolated child's relayed turn. Distinct from "not inside a turn", which is what the
-#: unset ContextVar below means.
-_UNATTRIBUTED_TURN: tuple[None, str] = (None, "")
+#: A turn NO signed-in connection submitted: a crash continuation, a wake-up, a cron run, a relayed
+#: bot DM, a hosted-room turn. It falls back to the session record, which for a single-user session is
+#: the same person and for a shared one is nobody. Deliberately NOT ``(None, "")``: that is a resolved
+#: ANSWER ("attributable to nobody"), which is what an isolated child is handed over the pipe, and it
+#: must bind empty instead of consulting the child's own copy of the record. Also distinct from the
+#: unset ContextVar, which means "not inside a turn at all" — there the request's connection answers.
+_UNATTRIBUTED_TURN: Any = object()
 
 #: ``(login, display name)`` of the connection that submitted the RUNNING turn, bound by
 #: ``_run_prompt_submit`` for the whole turn thread. The turn cannot read it off the transport itself:

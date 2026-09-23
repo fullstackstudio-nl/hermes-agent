@@ -55,12 +55,16 @@ def _compute_host_turn_frame(
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
         attached_images = list(image_paths if image_paths is not None else session.get("attached_images", []))
-    # The host pipe names no login of its own, so the gateway ships the identity this turn may be
-    # attributed to -- the submitting connection's where one was carried in, else the record's own stamp
-    # where nothing contradicts it -- and the display name that belongs to that same login, as one pair.
-    # The child builds its agent from this frame alone, so an identity missing here is missing for the
-    # whole isolated turn; one that is wrong here is wrong with the gateway's own authority.
-    auth_user_id, auth_user_name = turn_auth_user or _acting_auth_user(session)
+    # TWO identities, because they answer two different questions and an isolated turn must reach the
+    # same answers an inline one does. ``auth_user_id`` is the record's own stamp: the login the
+    # CONVERSATION belongs to, which is what the child builds its agent with, so memory stays scoped
+    # where an inline turn scopes it. ``turn_auth_user_*`` is WHO ASKED for this one turn, resolved
+    # HERE because only the gateway knows whether the session is shared -- the child's copy of the
+    # record has a single pipe peer and would read the stamp as unambiguous. An empty id is a resolved
+    # answer ("nobody"), not a missing field; a parent that predates these keys sends neither and the
+    # child keeps its old behaviour.
+    auth_user_id, auth_user_name = _session_auth_user(session)
+    turn_user_id, turn_user_name = turn_auth_user or _acting_auth_user(session)
     return {
         "type": "turn.start", "sid": sid, "request_id": rid,
         "session_key": session.get("session_key") or sid, "text": text,
@@ -75,6 +79,7 @@ def _compute_host_turn_frame(
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session), "attached_images": attached_images,
         "auth_user_id": auth_user_id, "auth_user_name": auth_user_name,
+        "turn_auth_user_id": turn_user_id or "", "turn_auth_user_name": turn_user_name,
         "queued_prompt_generation": queued_prompt_generation,
         # #101416: vouch that this process already holds the registry lease for this session, so
         # the child adopts it as an inert token instead of re-claiming and being fenced out by

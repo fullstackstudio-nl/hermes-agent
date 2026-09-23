@@ -190,6 +190,32 @@ def _typed_stop_phrase_response(rid, text):
 _HOSTED_TASK_FIELDS = {"room_id", "task_id", "thread_id", "turn_id", "execution_generation", "member_id"}
 
 
+def _is_internal_submit(params: dict) -> bool:
+    """Whether this ``prompt.submit`` is a dispatch the GATEWAY made rather than a person typing.
+
+    Keyed on the underscore prefix, not on a list of names, because the prefix IS the convention: the
+    in-process params are declared in ``contracts/prompt_voice.PromptSubmitParams`` as excluded fields
+    under an underscore alias ("injected by the hosted-room / bot-relay handlers, never accepted from a
+    client"), today ``_turn_author``, ``_hosted_task`` and ``_hosted_terminal_callback``. A future
+    internal caller is covered the day it declares its param, not the day someone remembers this
+    function. A client that sends an underscore param of its own only withholds its OWN attribution --
+    it can never acquire anybody else's -- so guessing wide fails closed."""
+    return any(str(key).startswith("_") and params.get(key) is not None for key in params)
+
+
+def _submit_auth_user(params: dict) -> tuple[str, str] | None:
+    """WHO ASKED for this submit: the signed-in identity of the connection it arrived on, or None when
+    no person did.
+
+    An internal submit names nobody, and that is the point rather than a detail. A relayed bot DM
+    (``methods_bot_relay``) and a hosted-room turn (``hosted_room_server_rpc``) reach this handler on
+    whatever socket happened to carry the RPC -- a person's open desktop, relaying somebody else's
+    message. Reading the login off that socket would attribute the turn to the relayer two lines after
+    the handler refused to let a client name an author at all. Such a turn is attributed by the author
+    the gateway stamped; the identity vars name no human, exactly as before this path existed."""
+    return None if _is_internal_submit(params) else _submitting_auth_user()
+
+
 def _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback):
     """Validate the hosted-room turn proof carried by an internal submit."""
     if session.get("source") != "bot_room":
@@ -596,15 +622,15 @@ def _(rid, params: dict) -> dict:
     # WHO ASKED. Read here, on the submitting connection's own request context, because this is the only
     # place that still has it: the turn runs on a thread that binds the SESSION's transport slot, and a
     # second attached client makes that a FanoutTransport naming nobody. It comes from the WS-upgrade
-    # credential the server minted and verified for this socket -- the params above are the client's own
-    # words, and they reach neither this value nor the author fence it sits beside.
-    submitter = _submitting_auth_user()
+    # credential the server minted and verified for this socket -- the params are the client's own words
+    # and reach neither this value nor the author fence above. An INTERNAL dispatch (the relay, a hosted
+    # room) arrives on a socket that belongs to whoever relayed it, not to the author, and names nobody.
+    submitter = _submit_auth_user(params)
     # WHO WROTE IT, on the row itself. The live path cannot say: message.start carries no payload and
     # two clients on one session share a FanoutTransport, so a client never learns from the socket
     # that somebody else typed anything -- it reads the row back afterwards, by which time every live
-    # signal is gone. So the author is stamped where it can still be proven, from the same identity
-    # the turn is attributed to, and nowhere else. The params above are the client's own words and
-    # reach neither this value nor the key it lands under.
+    # signal is gone. So the author is stamped from the same identity the turn is attributed to, which
+    # means an internally dispatched turn stamps nobody, exactly as it attributes nobody.
     from tui_gateway.row_author import with_row_author
     display_metadata = with_row_author(display_metadata, submitter)
     hosted_task = params.get("_hosted_task")
