@@ -63,7 +63,7 @@ The one-line installers below (`Quick Install`) are Nous Research's own hosted s
 To run **this fork** instead, clone it directly and install the same way the installer does under the hood — same dependency step, same `hermes` command:
 
 ```bash
-git clone https://github.com/fullstackstudio-nl/hermes-agent.git
+git clone https://github.com/fullstackstudio-org/hermes-agent.git
 cd hermes-agent
 
 # if you don't already have uv:
@@ -76,9 +76,9 @@ uv pip install -e ".[all]"
 hermes              # start chatting
 ```
 
-On Windows, clone with `git clone https://github.com/fullstackstudio-nl/hermes-agent.git` (PowerShell or Git Bash both work), then follow the same `uv venv` / `uv pip install -e ".[all]"` steps — the same limitation applies to `scripts/install.ps1`.
+On Windows, clone with `git clone https://github.com/fullstackstudio-org/hermes-agent.git` (PowerShell or Git Bash both work), then follow the same `uv venv` / `uv pip install -e ".[all]"` steps — the same limitation applies to `scripts/install.ps1`.
 
-Because this clones from `fullstackstudio-nl/hermes-agent` directly, `git remote -v` shows this fork as `origin`, and `hermes update` pulls from that `origin`. It installs the branch `main`, which is this fork's own code — so an update keeps you on the fork with no configuration at all.
+Because this clones from `fullstackstudio-org/hermes-agent` directly, `git remote -v` shows this fork as `origin`, and `hermes update` pulls from that `origin`. It installs the branch `main`, which is this fork's own code — so an update keeps you on the fork with no configuration at all.
 
 Note that `hermes update` does **not** follow whatever branch you have checked out: with no `--branch`, it targets `main` regardless, and a clean checkout parked on another branch is switched to `main` for you. That is why `main` carries this fork's code rather than a mirror of upstream. If you deliberately run a branch of your own, update it by naming it — `hermes update --branch <name>` — or the next update will move you off it.
 
@@ -289,14 +289,14 @@ See `hermes claw migrate --help` for all options, or use the `openclaw-migration
 
 ## Contributing
 
-We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process — it's written against upstream, but the code style and PR process apply here too. Contributions to this fork's own changes go against `main` in `fullstackstudio-nl/hermes-agent`, not upstream.
+We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process — it's written against upstream, but the code style and PR process apply here too. Contributions to this fork's own changes go against `main` in `fullstackstudio-org/hermes-agent`, not upstream.
 
 Quick start for contributors to this fork — clone it directly (the hosted
 installer always pulls upstream, see [Running this fork](#running-this-fork)
 above), then work from that checkout:
 
 ```bash
-git clone https://github.com/fullstackstudio-nl/hermes-agent.git
+git clone https://github.com/fullstackstudio-org/hermes-agent.git
 cd hermes-agent
 uv pip install -e ".[all,dev]"
 scripts/run_tests.sh

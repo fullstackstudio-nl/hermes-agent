@@ -38,7 +38,7 @@ jobs:
     # Belt and braces beside the disabled-upstream-workflows setting: even if
     # this file is merged into another fork or upstream itself, it never
     # publishes anywhere but our own registry namespace.
-    if: github.repository == 'fullstackstudio-nl/hermes-agent'
+    if: github.repository == 'fullstackstudio-org/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
@@ -88,12 +88,12 @@ jobs:
           build-args: |
             HERMES_GIT_SHA=${{ steps.vars.outputs.sha }}
           tags: |
-            ghcr.io/fullstackstudio-nl/hermes-agent:${{ steps.vars.outputs.short }}
-            ghcr.io/fullstackstudio-nl/hermes-agent:main
-            ghcr.io/fullstackstudio-nl/hermes-agent:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.short }}
+            ghcr.io/fullstackstudio-org/hermes-agent:${{ steps.vars.outputs.short }}
+            ghcr.io/fullstackstudio-org/hermes-agent:main
+            ghcr.io/fullstackstudio-org/hermes-agent:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.short }}
           labels: |
             org.opencontainers.image.revision=${{ steps.vars.outputs.sha }}
-            org.opencontainers.image.source=https://github.com/fullstackstudio-nl/hermes-agent
+            org.opencontainers.image.source=https://github.com/fullstackstudio-org/hermes-agent
             org.opencontainers.image.version=${{ steps.vars.outputs.version }}
           # The SQLite stage (`sqlite_build` in the Dockerfile) compiles from
           # source and only changes when SQLITE_AUTOCONF_VERSION does — GHA
@@ -107,14 +107,14 @@ jobs:
       # heavy import wall, so this catches a broken entrypoint or a broken
       # venv without running the full upstream docker-integration suite.
       - name: Smoke test the published image
-        run: docker run --rm "ghcr.io/fullstackstudio-nl/hermes-agent:${{ steps.vars.outputs.short }}" --version
+        run: docker run --rm "ghcr.io/fullstackstudio-org/hermes-agent:${{ steps.vars.outputs.short }}" --version
 
       - name: Record the digest
         run: |
           {
             echo "### Hermes Agent fork image"
             echo
-            echo "- \`ghcr.io/fullstackstudio-nl/hermes-agent@${{ steps.build.outputs.digest }}\`"
+            echo "- \`ghcr.io/fullstackstudio-org/hermes-agent@${{ steps.build.outputs.digest }}\`"
             echo "- version: \`${{ steps.vars.outputs.version }}\`"
             echo "- sha: \`${{ steps.vars.outputs.sha }}\`"
             echo "- tags: \`${{ steps.vars.outputs.short }}\`, \`main\`, \`${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.short }}\`"

@@ -1,6 +1,6 @@
 """``Origin`` checks for the dashboard: WebSocket upgrades and cookie-authenticated writes.
 
-Fork-only (fullstackstudio-nl/hermes-agent), built on ``dashboard_auth.origins``: with several
+Fork-only (fullstackstudio-org/hermes-agent), built on ``dashboard_auth.origins``: with several
 public origins listed, each is accepted exactly (scheme + host + port) and nothing else is
 loosened. The Host guard itself stays in ``web_server._is_accepted_host``; this module reaches
 it (and ``app.state``) late, like ``web_server_chat`` does, so importing it never imports the

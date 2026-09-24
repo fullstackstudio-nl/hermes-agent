@@ -1,6 +1,6 @@
 """The dashboard's public origins: the allow-list every Host, Origin and redirect_uri is held to.
 
-Fork-only (fullstackstudio-nl/hermes-agent). Upstream accepts ONE public URL
+Fork-only (fullstackstudio-org/hermes-agent). Upstream accepts ONE public URL
 (``dashboard.public_url``). This fork also reads ``dashboard.public_urls``, so the same gateway
 can be reached on e.g. ``https://hermes.example.com`` AND ``https://app.example.com`` (Hermie
 Web on its own domain), with a working OIDC sign-in on each.

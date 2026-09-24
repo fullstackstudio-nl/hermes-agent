@@ -1017,7 +1017,7 @@ making the service reachable from the public internet.
 
 ### Several public origins (this fork)
 
-`fullstackstudio-nl/hermes-agent` also reads `dashboard.public_urls`, a list of
+`fullstackstudio-org/hermes-agent` also reads `dashboard.public_urls`, a list of
 further origins the same dashboard is served on — for example Hermie Web on its
 own domain next to the gateway's:
 
