@@ -13,33 +13,147 @@ name: Fork image
 # amd64 only: the k3s nodes this image runs on are amd64. arm64 can be added
 # later the same way upstream's own workflow does it — a second build leg
 # plus a registry-side manifest merge — if we ever run this on arm hardware.
+#
+# The image bakes the Hermie plugin (Dockerfile build args HERMIE_PLUGIN_REF
+# and HERMIE_PLUGIN_COMMIT). The `plan` job resolves which plugin ref to bake
+# (the dispatch input when given, else the plugin's latest release tag) and
+# the commit it names right now; the build fails if the ref has moved by the
+# time it is fetched. The daily schedule rebuilds main only when that commit
+# differs from the `org.hermie.plugin.commit` label on the current `:main`
+# image, so a plugin release reaches the image within a day without a fork
+# push.
 
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: "30 4 * * *"
   workflow_dispatch:
     inputs:
       ref:
         description: Commit SHA or ref to build (defaults to main's tip)
         required: false
         type: string
+      plugin_ref:
+        description: Hermie plugin tag, branch or full commit SHA to bake (defaults to its latest release)
+        required: false
+        type: string
 
+# One group for pushes and the schedule (both build main), so two runs never
+# publish `:main` at the same time. A push cancels whatever is running; the
+# schedule never cancels anything and waits its turn instead.
 concurrency:
   group: fork-image-${{ inputs.ref || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
-  build:
-    name: Build, smoke test, and publish
+  plan:
+    name: Resolve the Hermie plugin ref
     # Belt and braces beside the disabled-upstream-workflows setting: even if
     # this file is merged into another fork or upstream itself, it never
     # publishes anywhere but our own registry namespace.
     if: github.repository == 'fullstackstudio-org/hermes-agent'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      plugin_ref: ${{ steps.plugin.outputs.ref }}
+      plugin_commit: ${{ steps.plugin.outputs.commit }}
+      plugin_tag: ${{ steps.plugin.outputs.tag }}
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      # Inputs reach the script through env only, never through `${{ }}`
+      # inside `run:`, and are validated before use: this repo is public.
+      - name: Resolve and validate the plugin ref
+        id: plugin
+        env:
+          INPUT_PLUGIN_REF: ${{ inputs.plugin_ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo=https://github.com/fullstackstudio-org/hermie-plugin.git
+          ref="${INPUT_PLUGIN_REF:-}"
+          if [[ -z "$ref" ]]; then
+            ref="$(gh release view -R fullstackstudio-org/hermie-plugin --json tagName -q .tagName)"
+          fi
+          # A tag, branch or full commit SHA; the same shape the Dockerfile's bake step accepts.
+          # Whole-string bash matches (a newline cannot sneak a second line past them).
+          shape='^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$'
+          if [[ ! "$ref" =~ $shape || "$ref" == *..* || "$ref" == *//* || "$ref" == *.lock \
+                || "$ref" == */ || "$ref" == *. ]]; then
+            echo "::error::invalid Hermie plugin ref"
+            exit 1
+          fi
+          sha_shape='^[0-9a-f]{40}$'
+          if [[ "$ref" =~ $sha_shape ]]; then
+            commit="$ref"
+          else
+            listing="$(git ls-remote -- "$repo" "refs/tags/$ref" "refs/tags/$ref^{}" "refs/heads/$ref")"
+            # Git's lookup order: a peeled tag, then the tag, then the branch.
+            commit=""
+            for want in "refs/tags/$ref^{}" "refs/tags/$ref" "refs/heads/$ref"; do
+              while IFS=$'\t' read -r sha name; do
+                if [[ -z "$commit" && "$name" == "$want" ]]; then commit="$sha"; fi
+              done <<< "$listing"
+            done
+          fi
+          if [[ ! "$commit" =~ $sha_shape ]]; then
+            echo "::error::the Hermie plugin ref does not name a branch, tag or commit"
+            exit 1
+          fi
+          # Docker tags allow [A-Za-z0-9_.-]; a branch like release/x becomes release-x.
+          tag="${ref//[^A-Za-z0-9_.-]/-}"
+          {
+            echo "ref=$ref"
+            echo "commit=$commit"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        if: github.event_name == 'schedule'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          PLUGIN_REF: ${{ steps.plugin.outputs.ref }}
+          PLUGIN_COMMIT: ${{ steps.plugin.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" != "schedule" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Commit label of the image `:main` points at now; empty when missing or unreadable.
+          current="$(docker buildx imagetools inspect ghcr.io/fullstackstudio-org/hermes-agent:main \
+            --format '{{json .Image}}' 2>/dev/null \
+            | jq -r '(if has("config") then . else .["linux/amd64"] end).config.Labels["org.hermie.plugin.commit"] // ""' \
+            2>/dev/null || true)"
+          if [[ "$current" == "$PLUGIN_COMMIT" ]]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "The :main image already bakes Hermie plugin $PLUGIN_REF ($PLUGIN_COMMIT); nothing to rebuild." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Hermie plugin ${current:-(none)} -> $PLUGIN_REF ($PLUGIN_COMMIT): rebuilding :main." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    name: Build, smoke test, and publish
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     timeout-minutes: 45
     outputs:
       digest: ${{ steps.build.outputs.digest }}
@@ -72,6 +186,38 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # `:<short>-plugin-<ref>` names the fork commit AND the baked plugin: after a
+      # nightly plugin-only rebuild `:<short>` points at new bytes, the combined tag
+      # does not. `:main` is only for builds of main itself: a manual dispatch of an
+      # older `ref` gets its sha tags but never moves `:main`, so it cannot race (or
+      # roll back) what a push to main published. tests/ci/test_fork_image_tags.py
+      # runs this script.
+      - name: Choose the image tags
+        id: tags
+        env:
+          IMAGE: ghcr.io/fullstackstudio-org/hermes-agent
+          EVENT: ${{ github.event_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          SHORT: ${{ steps.vars.outputs.short }}
+          VERSION: ${{ steps.vars.outputs.version }}
+          PLUGIN_TAG: ${{ needs.plan.outputs.plugin_tag }}
+        run: |
+          set -euo pipefail
+          tags=("$IMAGE:$SHORT" "$IMAGE:$VERSION-$SHORT" "$IMAGE:$SHORT-plugin-$PLUGIN_TAG")
+          main_tag=true
+          if [[ "$EVENT" == "workflow_dispatch" && -n "${INPUT_REF:-}" ]]; then
+            main_tag=false
+          fi
+          if [[ "$main_tag" == true ]]; then
+            tags+=("$IMAGE:main")
+          fi
+          {
+            echo "list<<EOF"
+            printf '%s\n' "${tags[@]}"
+            echo "EOF"
+            echo "main=$main_tag"
+          } >> "$GITHUB_OUTPUT"
+
       # `load: true` alongside `push: true` puts the just-published image in
       # the local daemon too, so the smoke test below runs the exact bytes
       # that were pushed rather than rebuilding to check them. Single
@@ -85,16 +231,18 @@ jobs:
           platforms: linux/amd64
           push: true
           load: true
+          # The plugin ref and commit were validated in the plan job.
           build-args: |
             HERMES_GIT_SHA=${{ steps.vars.outputs.sha }}
-          tags: |
-            ghcr.io/fullstackstudio-org/hermes-agent:${{ steps.vars.outputs.short }}
-            ghcr.io/fullstackstudio-org/hermes-agent:main
-            ghcr.io/fullstackstudio-org/hermes-agent:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.short }}
+            HERMIE_PLUGIN_REF=${{ needs.plan.outputs.plugin_ref }}
+            HERMIE_PLUGIN_COMMIT=${{ needs.plan.outputs.plugin_commit }}
+          tags: ${{ steps.tags.outputs.list }}
           labels: |
             org.opencontainers.image.revision=${{ steps.vars.outputs.sha }}
             org.opencontainers.image.source=https://github.com/fullstackstudio-org/hermes-agent
             org.opencontainers.image.version=${{ steps.vars.outputs.version }}
+            org.hermie.plugin.ref=${{ needs.plan.outputs.plugin_ref }}
+            org.hermie.plugin.commit=${{ needs.plan.outputs.plugin_commit }}
           # The SQLite stage (`sqlite_build` in the Dockerfile) compiles from
           # source and only changes when SQLITE_AUTOCONF_VERSION does — GHA
           # cache is what keeps that compile from re-running on every push.
@@ -107,9 +255,21 @@ jobs:
       # heavy import wall, so this catches a broken entrypoint or a broken
       # venv without running the full upstream docker-integration suite.
       - name: Smoke test the published image
-        run: docker run --rm "ghcr.io/fullstackstudio-org/hermes-agent:${{ steps.vars.outputs.short }}" --version
+        env:
+          IMAGE: ghcr.io/fullstackstudio-org/hermes-agent:${{ steps.vars.outputs.short }}
+          PLUGIN_REF: ${{ needs.plan.outputs.plugin_ref }}
+          PLUGIN_COMMIT: ${{ needs.plan.outputs.plugin_commit }}
+        run: |
+          set -euo pipefail
+          docker run --rm "$IMAGE" --version
+          # The baked plugin is there and is the ref and commit that were asked for.
+          docker run --rm --entrypoint cat "$IMAGE" /etc/hermes/hermie-plugin.json \
+            | jq -e --arg ref "$PLUGIN_REF" --arg commit "$PLUGIN_COMMIT" '.ref == $ref and .commit == $commit'
 
       - name: Record the digest
+        env:
+          PLUGIN_REF: ${{ needs.plan.outputs.plugin_ref }}
+          TAGS: ${{ steps.tags.outputs.list }}
         run: |
           {
             echo "### Hermes Agent fork image"
@@ -117,5 +277,9 @@ jobs:
             echo "- \`ghcr.io/fullstackstudio-org/hermes-agent@${{ steps.build.outputs.digest }}\`"
             echo "- version: \`${{ steps.vars.outputs.version }}\`"
             echo "- sha: \`${{ steps.vars.outputs.sha }}\`"
-            echo "- tags: \`${{ steps.vars.outputs.short }}\`, \`main\`, \`${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.short }}\`"
+            echo "- Hermie plugin: \`$PLUGIN_REF\`"
+            echo "- tags:"
+            while IFS= read -r tag; do
+              if [[ -n "$tag" ]]; then echo "  - \`$tag\`"; fi
+            done <<< "$TAGS"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -234,10 +234,12 @@ def _settings() -> dict:
             "with plugins.dashboard_auth.basic.hash_password).",
             level="warning")
     # Precedence: env password (hashed in-memory) overrides any config password_hash so
-    # operators can rotate without editing config; a config password_hash wins over a
-    # config-only plaintext password (preferred at-rest form).
+    # operators can rotate without editing config; a password_hash wins over a plaintext
+    # password from the same surface (preferred at-rest form) — env hash over env plaintext,
+    # config hash over config plaintext.
     plaintext_from_env = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "").strip()
-    if plaintext_from_env:
+    hash_from_env = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH", "").strip()
+    if plaintext_from_env and not hash_from_env:
         password_hash = hash_password(plaintext_from_env)
         logger.info("dashboard-auth-basic: hashed env-supplied password in-memory (overrides any config password_hash).")
     elif not password_hash:

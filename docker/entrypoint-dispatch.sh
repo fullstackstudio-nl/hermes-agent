@@ -22,4 +22,7 @@ echo "[hermes] WARNING: container entrypoint is not PID 1; skipping s6-overlay /
 # /init normally seeds PATH with s6's helpers; the non-PID-1 fallback skips it.
 export PATH="/command:/package/admin/s6/command:${PATH}"
 /opt/hermes/docker/stage2-hook.sh
+# Same environment-driven config step /init runs as /etc/cont-init.d/018-env-config; a non-zero
+# exit (invalid environment) stops the container here under `set -e`.
+sh /opt/hermes/docker/cont-init.d/018-env-config
 exec /opt/hermes/docker/main-wrapper.sh "$@"

@@ -24,6 +24,13 @@
 # and swallows the failure).
 set -e
 
+# 018-env-config rejected the container environment and is stopping the container: do not register
+# or start any profile gateway on the configuration it refused to change.
+if [ -e /run/hermes/env-config-failed ]; then
+    echo "reconcile: skipping (the container environment is invalid; see [env-config] above)"
+    exit 0
+fi
+
 # Make the dynamic scandir hermes-writable. The directory itself
 # starts root-owned by s6-overlay.
 chown hermes:hermes /run/service 2>/dev/null || true

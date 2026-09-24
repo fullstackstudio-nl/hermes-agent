@@ -80,6 +80,11 @@ _ENV_VAR_NAME_DENY_PREFIXES: tuple[str, ...] = (
     # PARAMETERS/COUNT/KEY_*/VALUE_* inject config pairs; GLOBAL/SYSTEM/NOSYSTEM redirect the
     # config sources _subprocess_compat already nulls for the same reason.
     "GIT_CONFIG_",
+    # Dashboard login credentials. ``.env`` is loaded with override semantics, so a copy written
+    # through the dashboard or by the agent would outrank the deployment's own value and survive
+    # its rotation (the old password keeps working). Set them in the process environment or in
+    # config.yaml's dashboard section instead.
+    "HERMES_DASHBOARD_BASIC_AUTH_", "HERMES_DASHBOARD_OIDC_",
 )
 
 _ENV_VAR_NAME_DENYLIST: frozenset[str] = frozenset({

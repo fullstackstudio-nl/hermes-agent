@@ -1,0 +1,50 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Configure $HERMES_HOME from the container environment (dashboard public URL, auth, trusted
+# proxies, profiles.max, the Hermie plugin), so a Kubernetes Deployment or `docker run -e` can set
+# a deployment up without anyone running `hermes setup`. All logic lives in
+# hermes_cli/container_env_config.py; this wrapper only drops privileges and turns a failure into
+# a stopped container.
+#
+# Ordering: after 01-hermes-setup (volume chown + config seeding) and 015-supervise-perms, before
+# 02-reconcile-profiles, which may auto-start profile gateways — they must boot on the new config.
+# The dashboard (an s6-rc service) starts after every cont-init script.
+#
+# Runs as the hermes user so config.yaml and the plugin tree keep hermes ownership. Also invoked
+# with `sh` by entrypoint-dispatch.sh on the non-PID-1 fallback path (no s6 /init).
+
+set -u
+
+export HOME=/opt/data
+py=/opt/hermes/.venv/bin/python
+# Read by 02-reconcile-profiles and main-wrapper.sh: while it exists, no gateway is started.
+marker=/run/hermes/env-config-failed
+rm -f "$marker" 2>/dev/null || true
+
+rc=0
+if [ "$(id -u)" = 0 ]; then
+    s6-setuidgid hermes "$py" -m hermes_cli.container_env_config || rc=$?
+else
+    "$py" -m hermes_cli.container_env_config || rc=$?
+fi
+
+if [ "$rc" -ne 0 ]; then
+    echo "[env-config] stopping the container: fix the environment above and start it again" >&2
+    # s6-overlay runs the remaining cont-init scripts and then starts every service after a failed
+    # one (S6_BEHAVIOUR_IF_STAGE2_FAILS defaults to 0). Narrow fix, this failure only:
+    #   - raising that setting to 2 in the container environment makes the cont-init stage itself
+    #     fail once the loop ends, so s6-rc starts none of the services that depend on it (the
+    #     dashboard, main-hermes);
+    #   - the marker stops 02-reconcile-profiles from registering or starting profile gateways and
+    #     main-wrapper.sh from running the CMD;
+    #   - halt stops the container with this exit code.
+    mkdir -p /run/hermes 2>/dev/null && : > "$marker" 2>/dev/null || true
+    if [ -d /run/s6/container_environment ]; then
+        printf '2' > /run/s6/container_environment/S6_BEHAVIOUR_IF_STAGE2_FAILS 2>/dev/null || true
+    fi
+    if [ -x /run/s6/basedir/bin/halt ]; then
+        echo "$rc" > /run/s6-linux-init-container-results/exitcode 2>/dev/null || true
+        /run/s6/basedir/bin/halt
+    fi
+    exit "$rc"
+fi

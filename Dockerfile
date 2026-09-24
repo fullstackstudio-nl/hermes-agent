@@ -383,6 +383,29 @@ RUN set -eu; \
     mkdir -p /etc/hermes; \
     HERMES_GIT_SHA="${HERMES_GIT_SHA}" python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": "nousresearch/hermes-agent", "version": project["version"], "revision": os.environ.get("HERMES_GIT_SHA") or None}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
 
+# ---------- Hermie plugin (baked) ----------
+# The Hermie companion plugin ships inside the image so a container gets it without a
+# network fetch at start: /etc/cont-init.d/018-env-config copies this tree into the volume's
+# $HERMES_HOME/plugins/hermie and enables it (HERMIE_PLUGIN=false opts out, a git ref fetches
+# that ref instead). The tree keeps its .git, because the plugin reports its installed build
+# from .git/HEAD. The plugin security scanner runs here, once, and prints its report into the
+# build log; a dangerous verdict fails the build. HERMIE_PLUGIN_REF is a tag, branch or full
+# commit SHA (the fork's image workflow passes the plugin's latest release tag); an empty value
+# builds an image without the plugin.
+# HERMIE_PLUGIN_COMMIT (optional) is the commit the ref must resolve to; the build fails when it
+# does not. HERMIE_PLUGIN_REPO lands in the image history: it must not carry credentials (the bake
+# step refuses a URL that does).
+ARG HERMIE_PLUGIN_REPO=https://github.com/fullstackstudio-org/hermie-plugin.git
+ARG HERMIE_PLUGIN_REF=v0.9.0
+ARG HERMIE_PLUGIN_COMMIT=
+LABEL org.hermie.plugin.ref="${HERMIE_PLUGIN_REF}"
+RUN set -eu; \
+    HERMES_HOME=/tmp/hermie-bake-home /opt/hermes/.venv/bin/python -m hermes_cli.container_env_config bake \
+        --repo "${HERMIE_PLUGIN_REPO}" --ref "${HERMIE_PLUGIN_REF}" --expect-commit "${HERMIE_PLUGIN_COMMIT}" \
+        --dest /opt/hermie-plugin --meta /etc/hermes/hermie-plugin.json; \
+    rm -rf /tmp/hermie-bake-home; \
+    if [ -d /opt/hermie-plugin ]; then chmod -R a+rX,go-w /opt/hermie-plugin; fi
+
 # ---------- s6-overlay service wiring ----------
 # Static services declared at build time: main-hermes + dashboard.
 # Per-profile gateway services are registered dynamically at runtime by
@@ -396,6 +419,10 @@ COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
 # `exec hermes`. Wired in as cont-init.d/01- so it
 # runs before user services start.
 #
+# 018-env-config applies the container environment (dashboard public URL,
+# auth, trusted proxies, profiles.max, the Hermie plugin) to $HERMES_HOME
+# before any gateway starts — see hermes_cli/container_env_config.py.
+#
 # 02-reconcile-profiles re-creates per-profile gateway s6 service
 # slots from $HERMES_HOME/profiles/<name>/ after a container restart
 # (the /run/service/ scandir is tmpfs and wiped on restart). Phase 4.
@@ -404,6 +431,7 @@ RUN mkdir -p /etc/cont-init.d && \
         > /etc/cont-init.d/01-hermes-setup && \
     chmod +x /etc/cont-init.d/01-hermes-setup
 COPY --chmod=0755 docker/cont-init.d/015-supervise-perms /etc/cont-init.d/015-supervise-perms
+COPY --chmod=0755 docker/cont-init.d/018-env-config /etc/cont-init.d/018-env-config
 COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-reconcile-profiles
 
 # ---------- Runtime ----------

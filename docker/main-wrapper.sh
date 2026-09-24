@@ -20,6 +20,13 @@
 # Drop to hermes via s6-setuidgid, but skip it when already non-root.
 set -e
 
+# 018-env-config rejected the container environment (see its log lines) and has asked s6 to stop
+# the container; never run the CMD on the configuration it refused to change.
+if [ -e /run/hermes/env-config-failed ]; then
+    echo "[hermes] not starting: the container environment is invalid (see [env-config] above)" >&2
+    exit 1
+fi
+
 if [ -z "${HERMES_MAIN_WRAPPER_ENV_READY:-}" ] && \
    [ -z "${HERMES_HOME:-}" ] && \
    [ -x /command/with-contenv ]; then

@@ -1343,6 +1343,10 @@ def create_profile(
                 logger.info("profile %s: cloned without messaging channels %s", canon, stripped)
         give_memory_identity(staging, canon)
         _finish_profile_layout(staging, no_skills=no_skills, clone_all=clone_all, description=description)
+        # Container image only: the Hermie plugin the image bakes reaches profiles created after the
+        # boot as well (best-effort, a no-op outside the image; see hermes_cli.container_env_config).
+        from hermes_cli.container_env_config import seed_new_profile
+        seed_new_profile(staging)
         os.rename(staging, profile_dir)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)

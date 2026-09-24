@@ -359,11 +359,243 @@ docker run -it --rm \
   nousresearch/hermes-agent
 ```
 
-Direct `-e` flags override values from `.env`. This is useful for CI/CD or secrets-manager integrations where you don't want keys on disk.
+This is useful for CI/CD or secrets-manager integrations where you don't want keys on disk. A key with the same name in `/opt/data/.env` wins over the `-e` value (Hermes loads that file with override semantics), so keep each key in one place. The exception is the variables of [Configure from environment variables](#configure-from-environment-variables): a copy of one of those is removed from `.env` at start. Named profiles read their own `profiles/<name>/.env`, not the container environment.
 
 :::note Looking for Docker as the **terminal backend**?
 This page covers running Hermes itself inside Docker. If you want Hermes to execute the agent's `terminal` / `execute_code` calls inside a Docker sandbox container (one long-lived container shared across Hermes processes — see issue #20561), that's a separate config block — `terminal.backend: docker` plus `terminal.docker_image`, `terminal.docker_volumes`, `terminal.docker_forward_env`, `terminal.docker_env`, `terminal.docker_run_as_host_user`, `terminal.docker_extra_args`, `terminal.docker_persist_across_processes`, and `terminal.docker_orphan_reaper`. See [Configuration → Docker Backend](configuration.md#docker-backend) for the full set including container-lifecycle rules.
 :::
+
+## Configure from environment variables
+
+The image can set itself up from environment variables, so a Kubernetes Deployment (or a plain
+`docker run -e …`) gets a working gateway and dashboard without anyone running `hermes setup` by
+hand. On every start, the init step `/etc/cont-init.d/018-env-config` (it calls
+`hermes_cli/container_env_config.py`) runs after the data volume is prepared and before any gateway
+or the dashboard starts. It writes the settings below into `/opt/data/config.yaml`, the default
+profile's config. The dashboard and `profiles.max` read their settings from that file.
+
+| Variable | Effect |
+|---|---|
+| `HERMES_DASHBOARD_PUBLIC_URL` | Sets `dashboard.public_url`, the primary public URL. Must be an absolute `http(s)://host[/prefix]` URL. |
+| `HERMES_DASHBOARD_PUBLIC_URLS` | Comma-separated further public URLs for `dashboard.public_urls` (for example Hermie Web on its own domain), written as a list. Each entry is checked the way the dashboard parses that list: an absolute `http(s)://host[:port][/prefix]` URL, no credentials, query or fragment. Register every `<url>/auth/callback` at your OIDC provider. |
+| `HERMES_DASHBOARD_WRITE_ORIGIN_CHECK` | `auto`, `on` or `off` for `dashboard.write_origin_check` (refuse cookie-authenticated writes from a browser `Origin` that is not listed). |
+| `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` | Sets `dashboard.basic_auth.username` (username/password dashboard login). |
+| `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` | Hashed at start with the basic auth plugin's own `hash_password` (scrypt). Only the hash is written, to `dashboard.basic_auth.password_hash`. The plaintext never reaches the volume. |
+| `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH` | A precomputed hash for `dashboard.basic_auth.password_hash`. If both password variables are set, the hash wins, at start and in the running dashboard. |
+| `HERMES_DASHBOARD_BASIC_AUTH_SECRET` | The session-signing secret, at least 16 bytes (e.g. `openssl rand -base64 32`). It stays in the environment and is not written to disk. If it is unset and basic auth is configured, a secret is generated once and kept in `dashboard.basic_auth.secret` on the volume, so sessions survive restarts. |
+| `HERMES_DASHBOARD_OIDC_ISSUER`, `HERMES_DASHBOARD_OIDC_CLIENT_ID` | Configure the self-hosted OIDC provider (`dashboard.oauth.self_hosted.issuer` / `.client_id`). They must be set together, and the issuer must use `https://` (plain `http` is allowed on localhost only). |
+| `HERMES_DASHBOARD_OIDC_CLIENT_SECRET` | Optional (without it the client is a public PKCE client). It is not allowed on its own. It stays in the environment and is not written to disk. |
+| `HERMES_DASHBOARD_OIDC_SCOPES` | Optional. Sets `dashboard.oauth.self_hosted.scopes` and must include `openid`. |
+| `HERMES_DASHBOARD_TRUSTED_PROXIES` | Comma-separated IP addresses or bounded CIDR networks for `dashboard.trusted_proxies`. `*`, `0.0.0.0/0` and `::/0` are refused. |
+| `HERMES_PROFILES_MAX` | Sets `profiles.max` (a whole number; `0` = unlimited). |
+| `HERMIE_PLUGIN` | The Hermie companion plugin; see [below](#the-hermie-plugin). |
+| `HERMES_DASHBOARD` | `1` starts the supervised dashboard (see [Running the dashboard](#running-the-dashboard)). |
+| `HERMES_DASHBOARD_HOST` / `HERMES_DASHBOARD_PORT` | Where the dashboard binds. Defaults: `0.0.0.0` and `9119`. Validated at start. |
+
+The dashboard-auth variables have the same names the dashboard's auth plugins already read, so
+they mean the same thing inside and outside a container.
+
+How it behaves:
+
+- **The environment is the source of truth for the keys it sets.** Every start reasserts exactly
+  the keys whose variable is set, even if someone changed them in the dashboard in between.
+  Keys that have no variable are never touched, so everything else you configure in the
+  dashboard survives restarts.
+- **Unsetting a variable does not delete its key.** The last value stays in `config.yaml` until you
+  change it there. A variable set to an empty string counts as unset.
+- **Nothing is written when nothing changed.** Two starts in a row with the same environment
+  leave `config.yaml` byte-identical, and the file is not rewritten at all. A write goes through a
+  temporary file and a rename. It keeps the rest of the file, including its comments, and it
+  keeps the file's owner and mode.
+- **Invalid values stop the container.** Examples: a URL without a scheme, a `HERMES_PROFILES_MAX`
+  that is not a whole number, an OIDC issuer without a client id, a username without a password.
+  Every problem is listed in the log, `config.yaml` is left exactly as it was, and the container
+  exits with code 1. Nothing runs on the configuration it refused: no profile gateway is
+  registered or started, the dashboard and the other supervised services do not start, and the
+  container's command does not run. (Only this step's failure does that; the image keeps s6's
+  default of carrying on past other failed init scripts.)
+- **Secrets stay out of the log.** The log names the keys that were set, never their values.
+- When the environment configures basic auth, an existing plaintext `dashboard.basic_auth.password`
+  is turned into a hash and removed from `config.yaml`. The `basic` plugin is taken out of
+  `plugins.disabled` if it was there, and the same goes for the OIDC plugin when OIDC variables
+  are set.
+- Precedence at runtime: the dashboard's auth plugins read these variables directly as well, and a
+  non-empty variable wins over `config.yaml`.
+- **A copy in `/opt/data/.env` never outranks the environment.** Hermes loads that file with
+  override semantics, so a key written there (through the dashboard's key editor or by the agent)
+  would beat the container's value and survive a rotation. At start, every variable in the table
+  above that is set in the container environment is removed from `/opt/data/.env`; the log names
+  the key, never the value. The dashboard's env writer also refuses every
+  `HERMES_DASHBOARD_BASIC_AUTH_*` and `HERMES_DASHBOARD_OIDC_*` name.
+- **A new password ends existing sessions.** Sessions are signed tokens that refresh for up to 30
+  days. When a start writes a new password hash (or a new username) and the session secret is the
+  generated one in `config.yaml`, that secret is regenerated in the same write, so every session
+  signed with the old one is refused. When you supply `HERMES_DASHBOARD_BASIC_AUTH_SECRET`
+  yourself, rotate that secret together with the password to revoke sessions.
+- **Agent processes never see the dashboard's secrets.** The password, password hash, session
+  secret and OIDC client secret are stripped from every process the agent starts (terminal,
+  code execution, browser, CLI agents).
+
+### Where the dashboard binds, and why that needs auth
+
+Inside the container, the dashboard binds `0.0.0.0:9119` by default, so a Kubernetes Service, an
+Ingress or a sidecar can reach it. A non-loopback bind always engages the dashboard's auth gate.
+If no auth provider is registered (basic auth, self-hosted OIDC or Nous OAuth), the dashboard
+**refuses to start**. It does not fall back to serving without auth, and `HERMES_DASHBOARD_INSECURE`
+no longer changes that. The init step logs a warning when `HERMES_DASHBOARD=1` is set on a
+non-loopback bind with no provider configured. A `dashboard.public_url` with a non-loopback host
+engages the gate even on a loopback bind. To keep the dashboard private to the pod (for example
+behind an authenticating sidecar), set `HERMES_DASHBOARD_HOST=127.0.0.1`. Basic auth is meant for
+trusted networks and VPNs. On the open internet, put the dashboard behind OIDC or Nous OAuth.
+
+### The Hermie plugin
+
+The image bakes the [Hermie](https://github.com/fullstackstudio-org/hermie-plugin) companion plugin
+in at build time. The build arg `HERMIE_PLUGIN_REF` (a tag, branch or full commit SHA; the fork's
+image workflow passes the plugin's latest release tag) selects the version, and the image label
+`org.hermie.plugin.ref` records it. The optional `HERMIE_PLUGIN_COMMIT` pins the commit that ref
+must resolve to (the workflow resolves it first, so a tag moved mid-build fails the build).
+`HERMIE_PLUGIN_REPO` ends up in the image history, so a URL with credentials in it is refused.
+The build runs the plugin security scanner once and prints the report in the build log. A caution
+verdict is accepted, the same as `hermes plugins install --force`, and a dangerous verdict fails
+the build. An empty `HERMIE_PLUGIN_REF` builds an image without the plugin.
+
+At start, `HERMIE_PLUGIN` decides what happens:
+
+| Value | Effect |
+|---|---|
+| unset | Use the baked plugin. `plugins/hermie` is made an exact copy of it, like `rsync --delete`, and recorded as a pinned install of the baked commit. If the copy already matches, it is left alone, and no scanner runs in the container. `hermie` is enabled only on the **first** install (no install record for it yet), and not even then when `plugins.disabled` names it. After that, whether it is enabled is up to you: the tree is kept in sync, `plugins.enabled`/`plugins.disabled` are not touched. To turn it off, use `hermes plugins disable hermie` (or set `HERMIE_PLUGIN=false`), not `hermes plugins remove hermie`: removing it deletes the install record, so the next start treats it as a first install and enables it again. |
+| `true` | The same sync, and the plugin is **reasserted** on every start: added to `plugins.enabled` and taken out of `plugins.disabled`. A deployment controller that owns the plugin sets this. On an image built without the plugin, `true` stops the container (unset just logs that there is nothing to install). |
+| `false` | Do nothing. No plugin is installed, synced, enabled or disabled, and a copy that is already there, whether an earlier start synced it or you installed it yourself, stays as it is, enabled or not. Disable or remove it with `hermes plugins disable hermie` / `hermes plugins remove hermie`. |
+| a git ref (tag, branch or full 40-character SHA) | Development override. The ref is fetched from the plugin's repository at start, the security scanner runs and prints its report in the container log (caution is accepted, dangerous blocks), and the plugin is installed pinned to that commit and reasserted like `true`. The install is skipped when that commit is already installed. A branch moves, so each start installs its current head. If the repository cannot be reached and a copy is already installed, that copy is kept, with a warning. If nothing is installed, the container stops. |
+
+**Every profile gets it.** The multiplexed gateway loads plugins per profile: each profile reads its
+own `plugins/` directory and its own `plugins.enabled`. So the same copy and the same enable rule
+are applied to the default profile and to every named profile (`/opt/data/profiles/<name>`), and a
+profile created while the container runs (`hermes profile create`, the dashboard) gets the plugin
+as it is created, before the gateway starts serving it. A profile that arrives another way
+(`hermes profile import`, a distribution install) gets it at the next container start. A named profile whose files cannot be
+updated is skipped with a warning instead of stopping the container. With `HERMIE_PLUGIN=false`
+no profile is touched.
+
+The installed copy is pinned, so `hermes plugins update hermie` refuses it, and the baked copy
+comes back on the next start anyway. To change the version, change the image or set a ref. The
+sync replaces any `plugins/hermie` it finds, including one you installed yourself from another
+source or fork; to keep your own copy, set `HERMIE_PLUGIN=false`.
+
+### Provider keys and the model
+
+Pass provider keys (`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) as ordinary
+environment variables, for example from a Kubernetes Secret. Nothing needs to be written for them.
+Keep three things in mind:
+
+- A key with the same name in `/opt/data/.env` **wins** over the container environment. Hermes
+  loads that file with override semantics. The dashboard variables above are the exception: a
+  copy of one of those is removed from `.env` at start.
+- The process environment serves the default profile only. A named profile (`hermes profile
+  create …`) reads its credentials from its own `profiles/<name>/.env`.
+- The model and provider choice live in `config.yaml` (`model.default`, `model.provider`,
+  `model.base_url`) and are not set from the environment. They travel together, and a provider
+  alone would not select a working endpoint. The seeded config uses OpenRouter, so
+  `OPENROUTER_API_KEY` alone gives a working gateway. To choose something else, pick the model
+  in the dashboard, or run `hermes model` once in the container. The environment never
+  overwrites that choice.
+
+### Example: `docker run`
+
+```sh
+docker run -d --name hermes --restart unless-stopped \
+  -v hermes-data:/opt/data \
+  -p 9119:9119 \
+  -e HERMES_DASHBOARD=1 \
+  -e HERMES_DASHBOARD_PUBLIC_URL=https://hermes.example.com \
+  -e HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin \
+  -e HERMES_DASHBOARD_BASIC_AUTH_PASSWORD="$(cat ./dashboard-password)" \
+  -e HERMES_DASHBOARD_TRUSTED_PROXIES=172.20.0.5 \
+  -e HERMES_PROFILES_MAX=5 \
+  -e OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+  ghcr.io/fullstackstudio-org/hermes-agent:main gateway run
+```
+
+### Example: Kubernetes
+
+One replica per volume. The gateway holds a lock in the data volume, so use `strategy: Recreate`.
+The container must start as root, because the init steps remap the `hermes` user and fix volume
+ownership before they drop privileges. Do not set `runAsNonRoot` or `runAsUser` on it.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hermes
+type: Opaque
+stringData:
+  HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: change-me
+  HERMES_DASHBOARD_BASIC_AUTH_SECRET: replace-with-openssl-rand-base64-32
+  OPENROUTER_API_KEY: sk-or-...
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hermes-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: hermes}
+  template:
+    metadata:
+      labels: {app: hermes}
+    spec:
+      containers:
+        - name: hermes
+          image: ghcr.io/fullstackstudio-org/hermes-agent:main
+          args: ["gateway", "run"]
+          ports:
+            - {name: dashboard, containerPort: 9119}
+          env:
+            - {name: HERMES_DASHBOARD, value: "1"}
+            - {name: HERMES_DASHBOARD_PUBLIC_URL, value: "https://hermes.example.com"}
+            - {name: HERMES_DASHBOARD_BASIC_AUTH_USERNAME, value: "admin"}
+            # The pod network your ingress controller runs in; bounded, never 0.0.0.0/0.
+            - {name: HERMES_DASHBOARD_TRUSTED_PROXIES, value: "10.42.0.0/16"}
+            - {name: HERMES_PROFILES_MAX, value: "5"}
+          envFrom:
+            - secretRef: {name: hermes}
+          volumeMounts:
+            - {name: data, mountPath: /opt/data}
+          readinessProbe:
+            httpGet: {path: /api/status, port: dashboard}
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: hermes-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes
+spec:
+  selector: {app: hermes}
+  ports:
+    - {name: dashboard, port: 9119, targetPort: dashboard}
+```
+
+To use your own identity provider instead of a password, replace the two basic-auth variables with
+`HERMES_DASHBOARD_OIDC_ISSUER` and `HERMES_DASHBOARD_OIDC_CLIENT_ID`, plus
+`HERMES_DASHBOARD_OIDC_CLIENT_SECRET` from the Secret for a confidential client. Register
+`https://hermes.example.com/auth/callback` as the redirect URI at the provider.
 
 ## Docker Compose example
 
