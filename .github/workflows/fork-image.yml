@@ -1,0 +1,121 @@
+name: Fork image
+
+# GHCR publishing for our fork. This is fork-only and deliberately a new file
+# rather than an edit to upstream's own `docker.yml` ("Docker Build, Test,
+# and Publish"): that workflow's `publish`/`merge` jobs are gated on
+# `github.repository == 'NousResearch/hermes-agent'`, so nothing there ever
+# reaches a registry for us, and editing it would conflict on every upstream
+# merge. Every upstream workflow in this repo is disabled from the
+# repository's Actions settings (not deleted, so a merge never conflicts on
+# them) — this is the only workflow that runs here, and it neither calls nor
+# depends on any of them.
+#
+# amd64 only: the k3s nodes this image runs on are amd64. arm64 can be added
+# later the same way upstream's own workflow does it — a second build leg
+# plus a registry-side manifest merge — if we ever run this on arm hardware.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit SHA or ref to build (defaults to main's tip)
+        required: false
+        type: string
+
+concurrency:
+  group: fork-image-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build, smoke test, and publish
+    # Belt and braces beside the disabled-upstream-workflows setting: even if
+    # this file is merged into another fork or upstream itself, it never
+    # publishes anywhere but our own registry namespace.
+    if: github.repository == 'fullstackstudio-nl/hermes-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Resolve the sha and version
+        id: vars
+        run: |
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "short=$(git rev-parse --short=7 HEAD)"
+            echo "version=$(grep -m1 '^version' pyproject.toml | sed -E 's/version *= *"([^"]+)"/\1/')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Set up Docker Buildx (retry)
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `load: true` alongside `push: true` puts the just-published image in
+      # the local daemon too, so the smoke test below runs the exact bytes
+      # that were pushed rather than rebuilding to check them. Single
+      # architecture (amd64), so loading it is well-defined.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          load: true
+          build-args: |
+            HERMES_GIT_SHA=${{ steps.vars.outputs.sha }}
+          tags: |
+            ghcr.io/fullstackstudio-nl/hermes-agent:${{ steps.vars.outputs.short }}
+            ghcr.io/fullstackstudio-nl/hermes-agent:main
+            ghcr.io/fullstackstudio-nl/hermes-agent:${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.short }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.vars.outputs.sha }}
+            org.opencontainers.image.source=https://github.com/fullstackstudio-nl/hermes-agent
+            org.opencontainers.image.version=${{ steps.vars.outputs.version }}
+          # The SQLite stage (`sqlite_build` in the Dockerfile) compiles from
+          # source and only changes when SQLITE_AUTOCONF_VERSION does — GHA
+          # cache is what keeps that compile from re-running on every push.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The same quick check the image's own docs use as the canonical
+      # example (`docker run --rm nousresearch/hermes-agent:latest
+      # --version`): hermes_cli's fast-path handles --version before the
+      # heavy import wall, so this catches a broken entrypoint or a broken
+      # venv without running the full upstream docker-integration suite.
+      - name: Smoke test the published image
+        run: docker run --rm "ghcr.io/fullstackstudio-nl/hermes-agent:${{ steps.vars.outputs.short }}" --version
+
+      - name: Record the digest
+        run: |
+          {
+            echo "### Hermes Agent fork image"
+            echo
+            echo "- \`ghcr.io/fullstackstudio-nl/hermes-agent@${{ steps.build.outputs.digest }}\`"
+            echo "- version: \`${{ steps.vars.outputs.version }}\`"
+            echo "- sha: \`${{ steps.vars.outputs.sha }}\`"
+            echo "- tags: \`${{ steps.vars.outputs.short }}\`, \`main\`, \`${{ steps.vars.outputs.version }}-${{ steps.vars.outputs.short }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
