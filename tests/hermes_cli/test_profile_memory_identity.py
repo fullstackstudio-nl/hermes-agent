@@ -105,6 +105,19 @@ class TestCreateProfile:
         assert scope_of(clone) == {agent_id, "team"}
         assert json.loads((clone / "mem0.json").read_text(encoding="utf-8"))["user_id"] == "owner"
 
+    def test_a_clone_carries_the_mem0_settings_but_not_the_identity_or_the_history(self, default_home):
+        """``--clone`` copies the active memory provider's own config, so a clone of a mem0 profile arrives
+        with its ``mem0.json``. It still runs under an identity of its own, and ``mem0/`` stays behind:
+        that directory holds the source's OSS history database -- its memories' past texts, not config."""
+        from hermes_cli.profiles import create_profile
+        (default_home / "mem0").mkdir()
+        (default_home / "mem0" / "history.db").write_bytes(b"the default profile's memory history")
+        clone = create_profile("scout", clone_config=True, no_alias=True)
+        agent_id = _own(clone, default_home)
+        assert scope_of(clone) == {agent_id, "team"}
+        assert json.loads((clone / "mem0.json").read_text(encoding="utf-8"))["user_id"] == "owner"
+        assert not (clone / "mem0").exists()
+
     def test_two_new_profiles_never_share_one(self, default_home):
         from hermes_cli.profiles import create_profile
         first = identity(create_profile("one", no_alias=True))

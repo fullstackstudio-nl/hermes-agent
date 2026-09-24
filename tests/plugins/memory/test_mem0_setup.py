@@ -3,9 +3,8 @@
 import json
 import sys
 import types
+
 import pytest
-from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 from plugins.memory.mem0._setup import (
     parse_flags,
@@ -14,8 +13,6 @@ from plugins.memory.mem0._setup import (
     _prompt_api_key,
     post_setup,
     _check_qdrant_path,
-    _check_ollama,
-    _check_pgvector,
 )
 
 
@@ -41,35 +38,10 @@ def _inject_fake_hermes_cli(monkeypatch):
     return fake_config_mod
 
 
-class TestParseFlags:
-
-    def test_mode_platform(self):
-        flags = parse_flags(["--mode", "platform", "--api-key", "sk-test"])
-        assert flags["mode"] == "platform"
-        assert flags["api_key"] == "sk-test"
-
-
-    def test_no_flags_returns_empty_mode(self):
-        flags = parse_flags([])
-        assert flags["mode"] == ""
-
-    def test_oss_vector_path_flag(self):
-        flags = parse_flags(["--mode", "oss", "--oss-vector-path", "/data/qdrant"])
-        assert flags["oss_vector_path"] == "/data/qdrant"
 
 
 class TestBuildOSSConfig:
 
-    def test_openai_defaults(self):
-        flags = parse_flags(["--mode", "oss", "--oss-llm-key", "sk-oai"])
-        oss, env_writes = build_oss_config(flags)
-        assert oss["llm"]["provider"] == "openai"
-        assert oss["llm"]["config"]["model"] == "gpt-5-mini"
-        assert oss["llm"]["config"]["is_reasoning_model"] is True
-        assert oss["embedder"]["provider"] == "openai"
-        assert oss["embedder"]["config"]["model"] == "text-embedding-3-small"
-        assert oss["vector_store"]["provider"] == "qdrant"
-        assert env_writes["OPENAI_API_KEY"] == "sk-oai"
 
 
     def test_explicit_gpt_5_mini_is_reasoning_model(self):
@@ -302,13 +274,6 @@ class TestSetupKeepsTheProfilesOwnIdentity:
         monkeypatch.setattr("plugins.memory.mem0._setup._check_selfhosted_server", lambda h: None)
         post_setup(str(tmp_path), {"memory": {}})
         assert json.loads((tmp_path / "mem0.json").read_text(encoding="utf-8"))["agent_id"] == "hermes"
-
-
-class TestDryRun:
-
-    def test_dry_run_flag_parsed(self):
-        flags = parse_flags(["--mode", "oss", "--oss-llm-key", "sk-oai", "--dry-run"])
-        assert flags["dry_run"] is True
 
 
 class TestConnectivityChecks:

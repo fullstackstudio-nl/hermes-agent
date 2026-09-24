@@ -223,16 +223,17 @@ def test_a_leftover_two_people_steered_into_names_nobody(room):
     assert steer_turn["author"] is None
 
 
-def test_a_steer_accepted_while_idle_keeps_its_steerer_into_the_next_turn(room):
-    """``session.steer`` on an idle session parks the text in the agent until the next turn -- which
-    may be somebody else's. The turn it surfaces in does not make it that person's."""
+def test_a_steer_sent_while_idle_never_waits_for_somebody_elses_turn(room):
+    """``session.steer`` on an idle session is refused, and the client sends the text as a message of its
+    own (#64578). So nothing waits in the agent for the next turn -- which may be somebody else's -- and
+    the words run as their sender's own turn."""
     agent, call, robin, sam = room
-    assert call(sam, "session.steer", text="check the totals too")["result"]["status"] == "queued"
+    assert call(sam, "session.steer", text="check the totals too")["result"]["status"] == "rejected"
 
     call(robin, "prompt.submit", text="summarise the report")
 
-    [steer_turn] = _replayed(agent, "check the totals too")
-    assert steer_turn["author"] == AUTHOR_SAM
+    assert _replayed(agent, "check the totals too") == []
+    assert "check the totals too" not in str(agent.turns)
 
 
 def test_a_steer_typed_as_a_busy_message_keeps_its_submitter(room, monkeypatch):
@@ -460,7 +461,9 @@ def test_a_turn_that_runs_inside_anothers_clean_up_cannot_hand_it_a_later_steere
 
     assert call("casey", "prompt.submit", text="quick question")["result"]["status"] == "streaming"
     _wait(lambda: len(settled) == 2 and not session.get("running"), "T2 to finish inside T1's clean-up")
-    assert call("pat", "session.steer", text="Y: and check the totals")["result"]["status"] == "queued"
+    # An idle session refuses a steer; Pat's client sends it as a message of its own (#64578).
+    assert call("pat", "session.steer", text="Y: and check the totals")["result"]["status"] == "rejected"
+    assert call("pat", "prompt.submit", text="Y: and check the totals")["result"]["status"] == "streaming"
 
     t1_may_continue.set()
     _wait(lambda: len(_replayed(agent, "X: use the staging data")) == 1

@@ -438,9 +438,10 @@ def test_a_new_identity_saved_before_the_first_pin_moves_the_scope_too(root):
 
 def test_the_launch_profiles_service_identity_is_never_offered_to_another_profile(root, monkeypatch, caplog):
     """A dashboard process running as the default profile, MEM0_AGENT_ID=default-own in its service
-    environment, edits named profile X by parameter: home override plus X's secret scope, and in a
-    single-profile process a scope miss falls through to os.environ. X must be offered hermes -- what it
-    runs under -- not the default's identity, and the save must keep it the pin."""
+    environment, edits named profile X by parameter: home override plus X's secret scope. A scope miss
+    there no longer falls through to os.environ (upstream fails it closed under a foreign-home scope),
+    and the identity rule must not depend on that: X must be offered hermes -- what it runs under -- not
+    the default's identity, and the save must keep it the pin."""
     from hermes_cli.web_routers.memory_providers import _write_memory_provider_config_values
     home = named(root, "x")
     monkeypatch.setenv("MEM0_AGENT_ID", "default-own")  # HERMES_HOME is the default profile's root
@@ -450,7 +451,7 @@ def test_the_launch_profiles_service_identity_is_never_offered_to_another_profil
         home_token = set_hermes_home_override(str(home))
         secret_token = secret_scope.set_secret_scope(secret_scope.build_profile_secret_scope(home))
         try:
-            assert secret_scope.get_secret("MEM0_AGENT_ID", "") == "default-own"  # the fall-through
+            assert secret_scope.get_secret("MEM0_AGENT_ID", "") == ""  # no fall-through to the service env
             yield
         finally:
             secret_scope.reset_secret_scope(secret_token)
