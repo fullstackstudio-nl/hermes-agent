@@ -40,11 +40,18 @@ def hand_back_leftover_steer(agent: Any, result: Dict[str, Any]) -> None:
     so it becomes the next user turn instead of being lost. Its sender rides along as
     ``pending_steer_author`` only when every word of it came from that one person."""
     from agent.interrupt_control import drain_pending_with_author
-    leftover, author = drain_pending_with_author(agent, "_drain_pending_steer")
+    contributors: list = []
+    if callable(getattr(type(agent), "_drain_pending_steer_contributors_entry", None)):
+        leftover, author, contributors = agent._drain_pending_steer_contributors_entry()
+    else:
+        leftover, author = drain_pending_with_author(agent, "_drain_pending_steer")
     if leftover:
         result["pending_steer"] = leftover
         if author:
             result["pending_steer_author"] = author
+        elif contributors:
+            # Several people wrote it: the next turn says so, and names them, instead of one or nobody.
+            result["pending_steer_contributors"] = contributors
 
 
 def _assistant_row_missing_visible_text(msg: dict) -> bool:

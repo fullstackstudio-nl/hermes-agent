@@ -6,6 +6,10 @@ compaction restatement merged onto the handoff carrier. Every one of them used t
 ``display_metadata`` -- and with it the first sender's name on the second sender's words. Once the
 joined row is written back (compaction, an edit or regenerate) that wrong name is stored for good. A
 joined row now names its author only when both rows named the same one; otherwise it names nobody.
+
+The pre-call repair goes further: it does not join two people's rows at all (nor a named row with an
+unnamed one), because the turn note on the joined row would then credit one person's words to the
+other. The request copy separates them with an assistant placeholder instead.
 """
 import os
 import tempfile
@@ -37,22 +41,30 @@ def _history_ending_in(*rows):
     return [_row("hello", ROBIN), {"role": "assistant", "content": "hi"}, *rows]
 
 
-@pytest.mark.parametrize("first, second, expected", [
-    (SAM, ROBIN, None), (SAM, None, None), (None, ROBIN, None), (ROBIN, ROBIN, ROBIN),
-], ids=["two_people", "second_unknown", "first_unknown", "same_person"])
-def test_the_repair_merge_names_an_author_only_when_both_rows_share_it(first, second, expected):
+def test_the_repair_merge_joins_one_persons_rows_and_keeps_their_author():
     messages = _history_ending_in(
-        _row("stop, use last year", first, title_preview="kept"), _row("what about Q3?", second))
+        _row("stop, use last year", ROBIN, title_preview="kept"), _row("what about Q3?", ROBIN))
 
     assert repair_message_sequence(None, messages) == 1
 
     merged = messages[-1]
     assert merged["content"] == "stop, use last year\n\nwhat about Q3?"
-    assert _author(merged) == expected
+    assert _author(merged) == ROBIN
     assert merged["display_metadata"]["title_preview"] == "kept"  # only the author is at stake
 
 
-def test_a_redirect_row_merged_with_the_next_persons_prompt_names_nobody():
+@pytest.mark.parametrize("first, second", [(SAM, ROBIN), (SAM, None), (None, ROBIN)],
+                         ids=["two_people", "second_unknown", "first_unknown"])
+def test_the_repair_never_joins_rows_it_cannot_credit_to_one_person(first, second):
+    messages = _history_ending_in(_row("stop, use last year", first), _row("what about Q3?", second))
+
+    assert repair_message_sequence(None, messages) == 0
+
+    assert [(m["content"], _author(m)) for m in messages[-2:]] == [
+        ("stop, use last year", first), ("what about Q3?", second)]
+
+
+def test_a_redirect_row_is_not_joined_with_the_next_persons_prompt():
     """Sam redirects Robin's turn; the model call fails before any assistant row follows, and Robin's
     next prompt lands straight after Sam's stamped correction."""
     agent = SimpleNamespace(_strip_think_blocks=lambda text: text, _current_streamed_assistant_text="")
@@ -63,8 +75,8 @@ def test_a_redirect_row_merged_with_the_next_persons_prompt_names_nobody():
 
     repair_message_sequence(None, messages)
 
-    assert "what about Q3?" in messages[-1]["content"] and "stop, use last year" in messages[-1]["content"]
-    assert _author(messages[-1]) is None
+    assert (messages[-1]["content"], _author(messages[-1])) == ("what about Q3?", ROBIN)
+    assert _author(messages[-2]) == SAM  # the correction stays Sam's own row
 
 
 def _agent(db, session_id):
@@ -83,8 +95,8 @@ def _stored_merged_row(db, session_id):
             if r.get("role") == "user" and "what about Q3?" in str(r.get("content"))]
 
 
-@pytest.mark.parametrize("first, second, expected", [(SAM, ROBIN, None), (ROBIN, ROBIN, ROBIN)],
-                         ids=["two_people", "same_person"])
+@pytest.mark.parametrize("first, second, expected", [(SAM, ROBIN, ROBIN), (ROBIN, ROBIN, ROBIN)],
+                         ids=["two_people_stay_apart", "same_person"])
 def test_a_merged_row_written_back_by_compaction_keeps_the_merge_rule(first, second, expected):
     from agent.conversation_compression import compress_context
     from hermes_state import SessionDB
@@ -112,8 +124,8 @@ def test_a_merged_row_written_back_by_compaction_keeps_the_merge_rule(first, sec
         db.close()
 
 
-@pytest.mark.parametrize("first, second, expected", [(SAM, ROBIN, None), (ROBIN, ROBIN, ROBIN)],
-                         ids=["two_people", "same_person"])
+@pytest.mark.parametrize("first, second, expected", [(SAM, ROBIN, ROBIN), (ROBIN, ROBIN, ROBIN)],
+                         ids=["two_people_stay_apart", "same_person"])
 def test_a_merged_row_written_back_by_replace_messages_keeps_the_merge_rule(first, second, expected):
     """An edit or regenerate writes the in-memory history back with ``replace_messages``."""
     from hermes_state import SessionDB

@@ -50,7 +50,8 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
 def _compute_host_turn_frame(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None, display_kind: str | None = None,
-    display_metadata: dict | None = None, turn_auth_user: tuple[str, str] | None = None) -> dict:
+    display_metadata: dict | None = None, turn_auth_user: tuple[str, str] | None = None,
+    origin: str = "", contributors: Any = ()) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
@@ -64,7 +65,17 @@ def _compute_host_turn_frame(
     # answer ("nobody"), not a missing field; a parent that predates these keys sends neither and the
     # child keeps its old behaviour.
     auth_user_id, auth_user_name = _session_auth_user(session)
-    turn_user_id, turn_user_name = turn_auth_user or _acting_auth_user(session)
+    if turn_auth_user:
+        turn_user_id, turn_user_name = turn_auth_user
+    else:
+        # Nobody submitted this turn (a relayed bot DM, a queued prompt naming nobody, a crash continuation):
+        # resolve it exactly as the inline turn does, with the unattributed sentinel bound, so the socket
+        # this request arrived on -- the relaying person's own, for a bot relay -- is never read.
+        token = _turn_auth_user.set(_UNATTRIBUTED_TURN)
+        try:
+            turn_user_id, turn_user_name = _acting_auth_user(session)
+        finally:
+            _turn_auth_user.reset(token)
     return {
         "type": "turn.start", "sid": sid, "request_id": rid,
         "session_key": session.get("session_key") or sid, "text": text,
@@ -80,6 +91,11 @@ def _compute_host_turn_frame(
         "source": _session_source(session), "attached_images": attached_images,
         "auth_user_id": auth_user_id, "auth_user_name": auth_user_name,
         "turn_auth_user_id": turn_user_id or "", "turn_auth_user_name": turn_user_name,
+        # How the turn came about. The pair above is the SCOPE the parent resolved (a turn nobody submitted
+        # falls back to the owner there, for tools); this is what keeps the child from telling the model
+        # that the owner sent it.
+        "turn_origin": origin or ("" if turn_auth_user else "unattributed"),
+        **({"turn_contributors": list(contributors)} if contributors else {}),
         "queued_prompt_generation": queued_prompt_generation,
         # #101416: vouch that this process already holds the registry lease for this session, so
         # the child adopts it as an inert token instead of re-claiming and being fenced out by
@@ -261,12 +277,13 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
 def _submit_prompt_to_compute_host(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None, display_kind: str | None = None,
-    display_metadata: dict | None = None, turn_auth_user: tuple[str, str] | None = None) -> dict:
+    display_metadata: dict | None = None, turn_auth_user: tuple[str, str] | None = None,
+    origin: str = "", contributors: Any = ()) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(rid, sid, session, text, image_paths=image_paths,
                                      queued_prompt_generation=queued_prompt_generation,
                                      display_kind=display_kind, display_metadata=display_metadata,
-                                     turn_auth_user=turn_auth_user)
+                                     turn_auth_user=turn_auth_user, origin=origin, contributors=contributors)
     # Caller JSON-RPC ids may repeat across sockets and turns. Use an opaque
     # dispatch lifetime token, installed before a fast child can send activity.
     turn_id = frame["turn_id"] = frame["request_id"] = uuid.uuid4().hex

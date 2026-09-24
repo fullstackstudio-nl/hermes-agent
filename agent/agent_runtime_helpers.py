@@ -552,6 +552,7 @@ def _prune_unanswered_tool_calls(messages: List[Dict]) -> Tuple[List[Dict], int]
 def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
     """Pass 3: merge consecutive plain-text user messages (no user input lost)."""
     from agent.context_compressor import _DB_PERSISTED_MARKER, split_user_originated_turn
+    from agent.message_metadata import authored_by_different_people
 
     repairs = 0
     merged: List[Dict] = []
@@ -568,6 +569,10 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
             and prev.get("display_kind") != STEER_DISPLAY_KIND
             # Only merge plain-text content; leave multimodal (list) content alone.
             and isinstance(prev.get("content", ""), str) and isinstance(msg.get("content", ""), str)
+            # Two people's rows stay two rows: joined, one sender's words would be credited to the other
+            # (and the turn note on the joined row would say so). The request copy separates them with an
+            # assistant placeholder instead (agent.turn_context.build_api_messages).
+            and not authored_by_different_people(prev, msg)
         ):
             prev_content, new_content = prev.get("content", ""), msg.get("content", "")
             merged_content = (
@@ -3504,7 +3509,8 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # user message (which persists like any other user turn).
         _requeue_pending_steer(agent, steer_text, steer_author)
         return
-    messages.append(steer_user_row(steer_text, steer_author))
+    from agent.turn_sender import interjection_clause
+    messages.append(steer_user_row(steer_text, steer_author, interjection_clause(agent, steer_author)))
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),

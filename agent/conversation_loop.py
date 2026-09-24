@@ -299,7 +299,12 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     elif visible:
         checkpoint_parts += ["Visible response before the interruption:", visible]
     checkpoint = "\n\n".join(checkpoint_parts)
-    correction = f"[Context from the interrupted assistant response]\n{checkpoint}\n\n{text}"
+    # What the model reads: a correction from somebody other than the turn's person says so, and text
+    # shaped like the gateway's turn note is relabelled (agent/turn_sender.py).
+    from agent.turn_sender import interjection_clause, relabel_note_lookalikes
+    clause = interjection_clause(agent, author)
+    said = f"{clause}\n{relabel_note_lookalikes(text)}" if clause else relabel_note_lookalikes(text)
+    correction = f"[Context from the interrupted assistant response]\n{checkpoint}\n\n{said}"
 
     # The live tail is normally user or tool, so an assistant placeholder + correction
     # keeps strict alternation; if the tail is already assistant, the checkpoint is folded

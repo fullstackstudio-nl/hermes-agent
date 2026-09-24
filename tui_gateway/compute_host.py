@@ -266,7 +266,8 @@ class ComputeHost:
                 request_id, sid, session, text, display_kind=frame.get("display_kind") or None,
                 display_metadata=(frame.get("display_metadata")
                                   if isinstance(frame.get("display_metadata"), dict) else None),
-                turn_auth_user=_frame_turn_auth_user(frame))
+                turn_auth_user=_frame_turn_auth_user(frame), origin=str(frame.get("turn_origin") or ""),
+                contributors=frame.get("turn_contributors") if isinstance(frame.get("turn_contributors"), list) else ())
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 while run_thread.is_alive():

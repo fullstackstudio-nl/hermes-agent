@@ -126,6 +126,15 @@ def _joined_author(record: Any, text: Any) -> Optional[dict]:
     return first if isinstance(first, dict) and all(m == first for m in markers) else None
 
 
+def _contributors(record: Any, text: Any, author: Optional[dict]) -> list:
+    """Every contribution's marker (an author dict, or None for one from nobody) when ``text`` is not
+    one provable author's but at least one of its contributors is named; otherwise ``[]``."""
+    if author is not None or not text or not isinstance(record, tuple) or len(record) != 2 or record[0] != text:
+        return []
+    markers = list(record[1])
+    return markers if any(isinstance(m, dict) for m in markers) else []
+
+
 def _author_markers(record: Any, existing: Any) -> list:
     """Markers already standing for ``existing`` pending text; text the record does not account for
     counts as one contribution from nobody."""
@@ -410,9 +419,16 @@ class InterruptControlMixin:
 
     def _drain_pending_steer_entry(self) -> tuple:
         """``(text, author)`` of the pending steer, cleared together; author None unless provable."""
+        return InterruptControlMixin._drain_pending_steer_contributors_entry(self)[:2]
+
+    def _drain_pending_steer_contributors_entry(self) -> tuple:
+        """``(text, author, contributors)``: as ``_drain_pending_steer_entry``, plus, when several people
+        (or a named person and nobody) wrote the text, one marker per contribution (see ``_contributors``)."""
         with _ic_lock(self, "_pending_steer_lock"):
             text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
-            author = _joined_author(getattr(self, _STEER_AUTHORS, None), text)
+            record = getattr(self, _STEER_AUTHORS, None)
+            author = _joined_author(record, text)
+            contributors = _contributors(record, text, author)
             self._pending_steer = None
             setattr(self, _STEER_AUTHORS, None)
-        return text, author
+        return text, author, contributors

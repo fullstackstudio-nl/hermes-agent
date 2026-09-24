@@ -420,7 +420,7 @@ def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str
     It is not authored by them: nobody typed a continuation, so its row names no author."""
     try:
         _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, prompt, turn_auth_user=turn_auth_user)
+        _run_prompt_submit(rid, sid, session, prompt, turn_auth_user=turn_auth_user, origin="continuation")
         if on_done is not None:
             on_done()
     except Exception as exc:
@@ -447,8 +447,13 @@ def _run_post_turn_followups(
         # is requeued under nobody's identity.
         from tui_gateway.row_author import auth_user_from_row_author
         steerer = auth_user_from_row_author(result.get("pending_steer_author"))
+        # Several people's words joined in one slot are nobody's alone: the turn says who wrote them.
+        contributors = [] if steerer else list(result.get("pending_steer_contributors") or [])
+        origin = ("" if steerer else "several" if contributors
+                  else "unsigned" if _session_auth_user_id(session) else "")
         with session["history_lock"]:
-            _enqueue_prompt(session, steer, session.get("transport"), turn_auth_user=steerer)
+            _enqueue_prompt(session, steer, session.get("transport"), turn_auth_user=steerer,
+                            origin=origin, contributors=contributors)
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:
@@ -630,9 +635,11 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
 def _invoke_agent(
     sid: str, session: dict, st: _TurnRun, prompt: Any, run_message: Any, streamer,
     images: list[str], display_kind: str | None, display_metadata: dict | None,
-    turn_author: dict | None = None, text: Any = None) -> None:
+    turn_author: dict | None = None, text: Any = None, origin: str = "", contributors: Any = ()) -> None:
     """Wire the streaming callbacks and run the conversation into ``st.result``.
-    ``text`` is the turn's raw submit, matched against the row staged by prompt.submit."""
+    ``text`` is the turn's raw submit, matched against the row staged by prompt.submit; ``origin`` is how
+    the turn came about (``tui_gateway.turn_sender_note.ORIGINS``; "" = a signed-in connection sent it), and
+    ``contributors`` who wrote a turn several people's words were joined into."""
     agent = st.agent
     # Bot Chat mirrors gateway.stream_consumer: deltas are withheld while the streamed buffer
     # could still resolve to a silence marker ("NO"->"NO_REPLY"), so a bare marker is never
@@ -686,6 +693,14 @@ def _invoke_agent(
     if turn_author and "turn_author" in run_params:
         run_kwargs["turn_author"] = turn_author
     _adopt_submit_user_row(session, agent, run_kwargs["persist_user_message"], text)
+    # Whom this turn works for, from the resolver HERMES_SESSION_USER_* was bound from; the agent sends it
+    # as the last block of the turn's user message, on the wire only. Staged every turn, "" included, so
+    # nothing staged for a turn that died before its prologue reaches the next person's turn.
+    from agent.turn_sender import stage_turn_sender
+    from tui_gateway.turn_sender_note import turn_sender
+    stage_turn_sender(agent, *turn_sender(
+        _acting_auth_user(session), origin=origin, record_login=_session_auth_user_id(session),
+        display_metadata=display_metadata, turn_author=turn_author, contributors=contributors))
     # Live-rename hook: auto-titling fires inside the turn prologue.
     _title_key = session.get("session_key") or sid
     agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
@@ -948,7 +963,7 @@ def _run_prompt_submit(
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     turn_author: dict | None = None,
     turn_auth_user: tuple[str, str] | None = None,
-    row_auth_user: tuple[str, str] | None = None) -> bool:
+    row_auth_user: tuple[str, str] | None = None, origin: str = "", contributors: Any = ()) -> bool:
     # TWO identities. ``turn_auth_user`` is who the turn works FOR -- memory, tools, permissions -- and a
     # turn nobody typed (the /goal continuation) still carries the person whose work it continues.
     # ``row_auth_user`` is who TYPED this exact text, passed only by a caller that holds it beside the
@@ -957,6 +972,9 @@ def _run_prompt_submit(
     # ``display_metadata`` already (and an isolated child receives it there, stamped by the parent).
     from tui_gateway.row_author import with_row_author
     display_metadata = with_row_author(display_metadata, row_auth_user)
+    # How the turn came about, for what the model is told (``turn_sender_note``). A turn no connection
+    # submitted and no caller described is one the gateway started itself.
+    origin = origin or ("" if turn_auth_user else "unattributed")
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
@@ -1031,7 +1049,7 @@ def _run_prompt_submit(
             prompt, run_message, cols, streamer = prepared
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
-                display_metadata, turn_author, text)
+                display_metadata, turn_author, text, origin=origin, contributors=contributors)
             status_note = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)

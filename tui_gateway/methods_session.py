@@ -2139,8 +2139,10 @@ def _correction_method(name: str, verb: str, accepted_status: str, supported, un
         # Redirect during the turn-build window (running=True, agent None): queue for the next turn instead of
         # a misleading 4010 the client swallows into a lost follow-up.
         if verb == "redirect" and agent is None and session.get("running"):
+            submitter = _submitting_auth_user()
             _enqueue_prompt(session, text, current_transport() or _stdio_transport,
-                            turn_auth_user=_submitting_auth_user())
+                            turn_auth_user=submitter,
+                            origin="unsigned" if not submitter and _session_auth_user_id(session) else "")
             session["last_active"] = time.time()
             return _ok(rid, {"status": "queued", "text": text})
         if not supported(agent):

@@ -537,13 +537,15 @@ STEER_MARKER_OPEN = (
 )
 STEER_MARKER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
 # Text after the "[" that opens one of Hermes' own control frames (the steer marker above, the compaction
-# handoff and its fallbacks, runtime/system notes, agent.context_compressor._SYNTHETIC_USER_ROW_PREFIXES,
+# handoff and its fallbacks, runtime/system notes, the gateway's turn note (agent/turn_sender.py),
+# agent.context_compressor._SYNTHETIC_USER_ROW_PREFIXES,
 # agent.title_generator._MACHINE_PREFIXES). Consumers that republish model output as role=user text
 # (hosted rooms) relabel these so a reply cannot reproduce the exact trusted shape. Keep the regex literal in
 # apps/desktop/src/plugins/hermes-bots/group-round-prompt.ts byte-equivalent to this list.
 CONTROL_FRAME_OPENERS = (
     "/?OUT-OF-BAND USER MESSAGE", "CONTEXT COMPACTION", "CONTEXT SUMMARY]", "PRIOR CONTEXT", "Runtime note:",
     "System note:", "System:", "SYSTEM]", "IMPORTANT:", "Planning state preserved", "ASYNC DELEGATION",
+    "Gateway note:",
 )
 
 
@@ -555,14 +557,26 @@ def format_steer_marker(steer_text: str) -> str:
 STEER_DISPLAY_KIND = "steer"
 
 
-def steer_user_row(steer_text: str, author: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def steer_user_row(
+    steer_text: str, author: Optional[Dict[str, Any]] = None, sender_clause: str = "",
+) -> Dict[str, Any]:
     """The standalone ``role:user`` row a mid-turn /steer is delivered as (after the newest tool
     result). Its own row — never smeared onto the already-persisted tool row, which append-only
     persistence would leave divergent from the live request — and typed so the alternation repair
     never merges the next real prompt into it and history renderers can label it. ``author`` is the
-    one sender of every word in ``steer_text``, when that is known; otherwise the row names nobody."""
-    row = {"role": "user", "content": format_steer_marker(steer_text).lstrip(),
-           "display_kind": STEER_DISPLAY_KIND}
+    one sender of every word in ``steer_text``, when that is known; otherwise the row names nobody.
+
+    What the model is sent (``api_content``, persisted with the row, so replay is byte-stable) also
+    carries ``sender_clause`` when the steer is not from the person the turn is for, and has text
+    shaped like the gateway's turn note relabelled; ``content`` stays what was typed."""
+    from agent.turn_sender import relabel_note_lookalikes
+
+    content = format_steer_marker(steer_text).lstrip()
+    row = {"role": "user", "content": content, "display_kind": STEER_DISPLAY_KIND}
+    body = relabel_note_lookalikes(steer_text)
+    sent = format_steer_marker(f"{sender_clause}\n{body}" if sender_clause else body).lstrip()
+    if sent != content:
+        row["api_content"] = sent
     if author:
         row["display_metadata"] = {"author": author}
     return row

@@ -39,6 +39,28 @@ def append_message(
     return message
 
 
+def row_author_id(message: Any) -> Optional[str]:
+    """The id in a row's ``display_metadata["author"]`` (dict, or JSON text as read back raw), or None."""
+    metadata = message.get("display_metadata") if isinstance(message, Mapping) else None
+    if isinstance(metadata, str):
+        import json
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            return None
+    author = metadata.get("author") if isinstance(metadata, dict) else None
+    author_id = author.get("id") if isinstance(author, dict) else None
+    return author_id if isinstance(author_id, str) and author_id else None
+
+
+def authored_by_different_people(first: Any, second: Any) -> bool:
+    """Whether two user rows name different senders (at least one of them named). Such rows are never
+    joined for role alternation: the joined row, and the turn note on it, would give one person's
+    words to the other."""
+    one, other = row_author_id(first), row_author_id(second)
+    return (one is not None or other is not None) and one != other
+
+
 def keep_shared_author(joined: MutableMapping[str, Any], other: Any) -> None:
     """After ``other``'s words were joined into ``joined``, drop ``display_metadata["author"]`` from
     ``joined`` unless ``other`` names the very same author.

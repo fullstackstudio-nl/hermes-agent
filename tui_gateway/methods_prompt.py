@@ -517,7 +517,7 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None, 
 
 def _run_after_agent_ready(
     rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author=None,
-    turn_auth_user=None
+    turn_auth_user=None, origin=""
 ):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
@@ -548,7 +548,8 @@ def _run_after_agent_ready(
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
-        terminal_callback=hosted_terminal_callback, turn_author=turn_author, turn_auth_user=turn_auth_user)
+        terminal_callback=hosted_terminal_callback, turn_author=turn_author, turn_auth_user=turn_auth_user,
+        origin=origin)
 
 
 _TRUNCATION_PARAMS = (
@@ -644,6 +645,11 @@ def _(rid, params: dict) -> dict:
     # signal is gone. So the author is stamped from the same identity the turn is attributed to, which
     # means an internally dispatched turn stamps nobody, exactly as it attributes nobody.
     from tui_gateway.row_author import replayed_row_metadata, with_row_author
+    # A person typed (or pressed) this from a connection that names no login -- stdio, the legacy token, the
+    # desktop's PTY child -- on a session whose record has one. Not an internal dispatch, so the model is
+    # told someone typed it, not that the gateway started it. A gateway that attributes nothing records nothing.
+    origin = ("unsigned" if submitter is None and not _is_internal_submit(params)
+              and _session_auth_user_id(session) is not None else "")
     display_metadata = (replayed_row_metadata(display_metadata, row_submitter, submitter) if replayed is not None
                         else with_row_author(display_metadata, submitter))
     hosted_task = params.get("_hosted_task")
@@ -707,7 +713,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport, queued=bool(params.get("queued")) or replayed is not None,
             turn_author=turn_author, turn_auth_user=submitter,
-            row_metadata=display_metadata if replayed is not None else None)
+            row_metadata=display_metadata if replayed is not None else None, origin=origin)
         if busy_response is not None:
             return busy_response
     raw_rebind_ids = params.get("rebind_survivor_row_ids")
@@ -733,7 +739,7 @@ def _(rid, params: dict) -> dict:
                          turn_author.get("id"))
         isolated_response = _submit_prompt_to_compute_host(
             rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata,
-            turn_auth_user=submitter)
+            turn_auth_user=submitter, origin=origin)
         if not isolated_response.get("error"):
             # The truncation already happened inline above (memory + DB).
             isolated_response["result"].update(survivor_fields)
@@ -758,7 +764,7 @@ def _(rid, params: dict) -> dict:
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
             rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author,
-            submitter),
+            submitter, origin),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread

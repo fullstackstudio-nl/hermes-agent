@@ -537,13 +537,19 @@ def _with_tool_call_labels(message: dict) -> dict:
     return {**message, "tool_call_labels": labels} if labels else message
 
 
+def _without_wire_copy(message: dict) -> dict:
+    """``message`` without ``api_content``: the exact bytes sent to the model provider, which carry the
+    gateway's per-turn notes and injected context. An internal replay copy, never a client's."""
+    return {key: value for key, value in message.items() if key != "api_content"}
+
+
 def _project_for_display(messages: list) -> list:
     from agent.compaction_display import project_compaction_message_for_display
     from agent.context_compressor import is_compaction_summary_message
 
     projected_messages = []
     for message in messages:
-        message = _with_tool_call_labels(message)
+        message = _with_tool_call_labels(_without_wire_copy(message))
         if not is_compaction_summary_message(message):
             projected_messages.append(message)
             continue
@@ -774,7 +780,7 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
             while True:
                 messages = db.get_messages(sid, limit=500, after_id=last_id)
                 for message in messages:
-                    yield ("" if first else ",") + _compact_json(message)
+                    yield ("" if first else ",") + _compact_json(_without_wire_copy(message))
                     first = False
                 last_id = messages[-1].get("id") if len(messages) == 500 else None
                 if last_id is None:  # short page, or cannot keyset without row ids
