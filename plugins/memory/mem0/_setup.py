@@ -147,6 +147,12 @@ def _write_env(env_path: Path, env_writes: dict[str, str]) -> None:
     env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
 
+def _agent_id_default(hermes_home: str) -> str:
+    """The agent_id setup offers and, non-interactively, keeps (``_identity.setup_default_agent_id``)."""
+    from ._identity import setup_default_agent_id
+    return setup_default_agent_id(hermes_home)
+
+
 def _activate_provider(config: dict) -> None:
     """Point config.yaml's memory.provider at mem0."""
     from hermes_cli.config import save_config
@@ -155,10 +161,11 @@ def _activate_provider(config: dict) -> None:
 
 
 def _persist_provider_config(hermes_home: str, config: dict, provider_config: dict, env_writes: dict[str, str], label: str, key_line: str, server: str | None = None) -> None:
-    """Shared platform/self-hosted tail: activate, write mem0.json (0600), then .env, then a saved summary."""
-    _activate_provider(config)
+    """Shared platform/self-hosted tail: write mem0.json (0600), activate, then .env, then a saved summary.
+    mem0.json first: whether a saved "hermes" is the pin depends on the provider before activation."""
     from plugins.memory.mem0 import Mem0MemoryProvider
     Mem0MemoryProvider().save_config(provider_config, hermes_home)
+    _activate_provider(config)
     if env_writes:
         _write_env(Path(hermes_home) / ".env", env_writes)
     if server:
@@ -173,7 +180,7 @@ def _setup_platform(hermes_home: str, config: dict, flags: dict[str, str]) -> No
     provider_config = read_json_or_empty(Path(hermes_home) / "mem0.json")
     print("\n  Configuring mem0:\n")
     env_writes = _api_key_writes(flags, "Mem0 Platform API key", url="https://app.mem0.ai")
-    for key, desc, default in (("user_id", "User identifier", "hermes-user"), ("agent_id", "Agent identifier", "hermes")):
+    for key, desc, default in (("user_id", "User identifier", "hermes-user"), ("agent_id", "Agent identifier", _agent_id_default(hermes_home))):
         if val := _prompt(desc, default=str(provider_config.get(key) or default)):
             provider_config[key] = val
     choices = ["true", "false"]
@@ -215,7 +222,7 @@ def _setup_selfhosted(hermes_home: str, config: dict, flags: dict[str, str]) -> 
     host = host.rstrip("/")
     env_writes = _api_key_writes(flags, "Server API key", fresh_label="Server API key (blank if AUTH_DISABLED)")
     user_id = flags.get("user_id") or _prompt("User identifier", default=provider_config.get("user_id") or "hermes-user")
-    agent_id = _prompt("Agent identifier", default=provider_config.get("agent_id") or "hermes")
+    agent_id = _prompt("Agent identifier", default=_agent_id_default(hermes_home))
     if flags.get("dry_run"):
         _print_dry_run(f"host={host}, user_id={user_id}, agent_id={agent_id}", env_writes, lambda: _check_selfhosted_server(host))
         return
@@ -242,7 +249,10 @@ def _finish_oss(hermes_home: str, config: dict, oss_config: dict, env_writes: di
     if env_writes:
         _write_env(Path(hermes_home) / ".env", env_writes)
     config_path = Path(hermes_home) / "mem0.json"  # merge-write, plain text (platform path uses save_config's 0600 atomic write)
-    config_path.write_text(json.dumps({**read_json_or_empty(config_path), "mode": "oss", "user_id": user_id, "agent_id": agent_id, "oss": oss_config}, indent=2) + "\n", encoding="utf-8")
+    from ._identity import settle_saved_identity
+    before = read_json_or_empty(config_path)
+    merged = settle_saved_identity(hermes_home, before, {**before, "mode": "oss", "user_id": user_id, "agent_id": agent_id, "oss": oss_config})
+    config_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
     _install_provider_deps(oss_config["llm"]["provider"], oss_config["embedder"]["provider"], oss_config["vector_store"]["provider"])
     if pgvector_config:
         _ensure_pgvector_extension(pgvector_config)
@@ -265,7 +275,7 @@ def _setup_oss(hermes_home: str, config: dict, flags: dict[str, str]) -> None:
         _run_connectivity_checks(oss_config)
         print("  [dry-run] No files written.\n")
         return
-    _finish_oss(hermes_home, config, oss_config, env_writes, flags.get("user_id") or os.getenv("USER", "hermes-user"), "hermes")
+    _finish_oss(hermes_home, config, oss_config, env_writes, flags.get("user_id") or os.getenv("USER", "hermes-user"), _agent_id_default(hermes_home))
 
 
 def _docker(*args: str, timeout: int, **kwargs) -> subprocess.CompletedProcess:
@@ -416,7 +426,7 @@ def _setup_oss_interactive(hermes_home: str, config: dict) -> None:
         pg_password = getpass.getpass("  PostgreSQL password (blank if none): ").strip()
         pgvector_config = {**pg, "port": int(pg["port"]), **({"password": pg_password} if pg_password else {})}
     user_id = _input("User ID", os.getenv("USER", "hermes-user"))
-    agent_id = _input("Agent ID", "hermes")
+    agent_id = _input("Agent ID", _agent_id_default(hermes_home))
     flags = {
         "oss_llm": llm_id, "oss_llm_model": llm_model, "oss_llm_url": llm_url or "",
         "oss_llm_key": env_writes.get(llm_def["env_var"], "") if llm_def.get("env_var") else "",

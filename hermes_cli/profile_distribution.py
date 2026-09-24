@@ -496,7 +496,8 @@ def install_distribution(
 ) -> InstallPlan:
     """Install a distribution from *source* into a new profile; returns the resolved plan.
     Use :func:`plan_install` first to preview + prompt."""
-    from hermes_cli.profiles import check_alias_collision, create_wrapper_script
+    from hermes_cli.profiles import check_alias_collision, create_wrapper_script, give_memory_identity
+    from plugins.memory.mem0._identity import current_identity
     with tempfile.TemporaryDirectory(prefix="hermes_dist_install_") as tmp:
         plan = plan_install(source, Path(tmp), override_name=name)
         if plan.existing and not force:
@@ -507,8 +508,12 @@ def install_distribution(
 
         # Fresh install (or --force): config.yaml comes from the distribution. Roots the
         # payload does not ship are left alone either way, so --force keeps user skills.
+        # One distribution, many installs: an agent_id it ships would be every install's. A forced
+        # reinstall over a profile keeps the identity that profile has, from mem0.json or .env.
+        keep, keep_source = current_identity(plan.target_dir) if plan.existing else (None, None)
         _bootstrap_user_dirs(plan.target_dir)
         _copy_dist_payload(plan.staged_dir, plan.target_dir, plan.manifest, preserve_config=False)
+        give_memory_identity(plan.target_dir, plan.target_dir.name, keep, keep_source, fresh=not plan.existing)
         if create_alias and check_alias_collision(plan.manifest.name) is None:
             create_wrapper_script(plan.manifest.name)
         return plan
@@ -527,6 +532,8 @@ def _existing_profile(profile_name: str) -> Tuple[str, Path]:
 def update_distribution(profile_name: str, force_config: bool = False) -> InstallPlan:
     """Re-pull from the installed manifest's ``source:`` and apply: dist-owned files
     overwritten, user data never touched, ``config.yaml`` preserved unless ``force_config``."""
+    from hermes_cli.profiles import give_memory_identity
+    from plugins.memory.mem0._identity import current_identity
     canon, target = _existing_profile(profile_name)
     existing_manifest = read_manifest(target)
     if existing_manifest is None:
@@ -542,7 +549,12 @@ def update_distribution(profile_name: str, force_config: bool = False) -> Instal
     with tempfile.TemporaryDirectory(prefix="hermes_dist_update_") as tmp:
         plan = plan_install(existing_manifest.source, Path(tmp), override_name=canon)
         plan.preserves_config = not force_config
+        keep, keep_source = current_identity(plan.target_dir)
         _copy_dist_payload(plan.staged_dir, plan.target_dir, plan.manifest, preserve_config=plan.preserves_config)
+        # The profile keeps the identity it has, from mem0.json or .env. One that never had any and
+        # still gets none from the distribution is left to the provider's own start-up handling.
+        if current_identity(plan.target_dir)[0] != keep:
+            give_memory_identity(plan.target_dir, plan.target_dir.name, keep, keep_source, fresh=False)
         return plan
 
 

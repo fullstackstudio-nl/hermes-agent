@@ -435,6 +435,21 @@ class TestProfileCreateMaxLimit:
         assert (isolated_profiles["default"] / "profiles" / "roomleft").is_dir()
 
 
+class TestProfileCreateMemoryIdentity:
+    """POST /api/profiles gives the new profile a mem0 identity of its own, fresh or cloned, instead
+    of the ``hermes`` fallback the default profile runs under."""
+
+    @pytest.mark.parametrize("body", [{}, {"clone_from_default": True}, {"clone_from": "worker_beta"}])
+    def test_the_new_profile_has_its_own_identity(self, client, isolated_profiles, monkeypatch, body):
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "create_wrapper_script", lambda name: None)
+        (isolated_profiles["default"] / ".env").write_text("MEM0_AGENT_ID=hermes\n", encoding="utf-8")
+        resp = client.post("/api/profiles", json={"name": "fresh", **body})
+        assert resp.status_code == 200, resp.text
+        mem0 = json.loads((isolated_profiles["default"] / "profiles" / "fresh" / "mem0.json").read_text(encoding="utf-8"))
+        assert mem0["agent_id"].startswith("hermes-fresh-")
+
+
 class TestProfileScopedPostSetup:
     def test_post_setup_spawns_with_profile_flag(
         self, client, isolated_profiles, monkeypatch

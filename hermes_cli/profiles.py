@@ -1223,6 +1223,7 @@ def create_profile(
             stripped = strip_channel_settings(staging, include_state=clone_all, source_dir=source_dir)
             if stripped:
                 logger.info("profile %s: cloned without messaging channels %s", canon, stripped)
+        give_memory_identity(staging, canon)
         _finish_profile_layout(staging, no_skills=no_skills, clone_all=clone_all, description=description)
         os.rename(staging, profile_dir)
     except BaseException:
@@ -1237,6 +1238,22 @@ def create_profile(
     # rescans periodically, so a missed signal only delays serving).
     _notify_multiplexer(canon)
     return profile_dir
+
+
+def give_memory_identity(profile_dir: Path, canon: str, keep: Optional[str] = None,
+                         keep_source: Optional[str] = None, fresh: bool = True) -> None:
+    """Give a profile that has just come into existence a mem0 identity of its own.
+
+    Without one the mem0 provider runs a profile under ``hermes``, the default profile's identity,
+    and a clone's copied ``.env`` names its source's -- either way the new profile reads and writes
+    another profile's memory. Every path that makes a profile (create and clone, import,
+    distribution install) calls this, whatever memory provider the profile uses today, so one that
+    turns mem0 on later is already isolated. ``keep`` holds a distribution reinstall or update on the
+    identity the profile already had; ``fresh`` is False there, for a profile that already existed. The rules live with the provider:
+    ``plugins/memory/mem0/_identity.py``."""
+    from plugins.memory.mem0._identity import give_own_identity
+    agent_id = give_own_identity(profile_dir, canon, keep=keep, keep_source=keep_source, fresh=fresh)
+    logger.debug("profile %s: mem0 agent_id %s", canon, agent_id)
 
 
 def _clone_staging_dir(profile_dir: Path) -> Path:
@@ -2048,6 +2065,9 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
             final_source = staging_root / canon
             extracted.rename(final_source)
         drop_profile_role(final_source)
+        # An archive is a copy: the identity it carries is the exported profile's (or, from an
+        # install that predates per-profile identities, the shared fallback), never this one's.
+        give_memory_identity(final_source, canon)
         shutil.move(str(final_source), str(profile_dir))
     return profile_dir
 

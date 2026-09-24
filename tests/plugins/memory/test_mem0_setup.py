@@ -239,6 +239,71 @@ class TestPostSetup:
         assert mem0_json["user_id"] == "hermes-user"
 
 
+class TestSetupKeepsTheProfilesOwnIdentity:
+    """`hermes memory setup` must not hand a profile the default profile's identity."""
+
+    def test_oss_flag_mode_keeps_the_agent_id_the_profile_has(self, tmp_path, monkeypatch):
+        (tmp_path / "mem0.json").write_text(json.dumps({"agent_id": "hermes-bot-1a2b3c4d"}), encoding="utf-8")
+        monkeypatch.setattr("sys.argv", ["hermes", "--mode", "oss", "--oss-llm-key", "sk-oai"])
+        _inject_fake_hermes_cli(monkeypatch)
+        for name in ("_install_provider_deps", "_run_connectivity_checks", "_print_oss_summary"):
+            monkeypatch.setattr(f"plugins.memory.mem0._setup.{name}", lambda *a, **kw: None)
+        post_setup(str(tmp_path), {"memory": {}})
+        assert json.loads((tmp_path / "mem0.json").read_text(encoding="utf-8"))["agent_id"] == "hermes-bot-1a2b3c4d"
+
+    @staticmethod
+    def _wizard(tmp_path, monkeypatch, config_yaml, *, typed=None):
+        """Run the self-hosted wizard for named profile ``old`` with the real config loader. Only the
+        UI is stubbed, and activation really selects mem0 in config.yaml, as the wizard does."""
+        root = tmp_path / ".hermes"
+        home = root / "profiles" / "old"
+        home.mkdir(parents=True)
+        if config_yaml is not None:
+            (home / "config.yaml").write_text(config_yaml, encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.delenv("MEM0_AGENT_ID", raising=False)
+        monkeypatch.setattr("sys.argv", ["hermes", "--mode", "selfhosted", "--host", "http://localhost:8888"])
+
+        def _prompt(label, default=None, secret=False):
+            return typed if typed is not None and label == "Agent identifier" else default or ""
+
+        def _activate(config):
+            (home / "config.yaml").write_text("memory:\n  provider: mem0\n", encoding="utf-8")
+
+        monkeypatch.setattr("plugins.memory.mem0._setup._prompt", _prompt)
+        monkeypatch.setattr("plugins.memory.mem0._setup._curses_select", lambda *a, **kw: 0)
+        monkeypatch.setattr("plugins.memory.mem0._setup._activate_provider", _activate)
+        monkeypatch.setattr("plugins.memory.mem0._setup._check_selfhosted_server", lambda h: None)
+        post_setup(str(home), {"memory": {}})
+        return json.loads((home / "mem0.json").read_text(encoding="utf-8"))
+
+    def test_a_named_profile_not_on_mem0_is_offered_its_own(self, tmp_path, monkeypatch):
+        saved = self._wizard(tmp_path, monkeypatch, "memory:\n  provider: ''\n")
+        assert saved["agent_id"].startswith("hermes-old-") and "agent_id_source" not in saved
+
+    def test_typing_hermes_where_its_own_was_offered_is_a_choice_not_the_pin(self, tmp_path, monkeypatch):
+        """Decided on the config as it was before the wizard switched the provider to mem0."""
+        saved = self._wizard(tmp_path, monkeypatch, "memory:\n  provider: ''\n", typed="hermes")
+        assert saved["agent_id"] == "hermes" and "agent_id_source" not in saved
+
+    @pytest.mark.parametrize("config_yaml", [
+        "memory:\n  provider: mem0\n",      # already on mem0, ran under the fallback
+        "memory: [\n  provider: mem0\n",    # cannot be read: treated like mem0
+        None,                                # no config.yaml of its own: same
+    ])
+    def test_enter_where_hermes_is_offered_keeps_it_pinned(self, tmp_path, monkeypatch, config_yaml):
+        saved = self._wizard(tmp_path, monkeypatch, config_yaml)
+        assert (saved["agent_id"], saved["agent_id_source"]) == ("hermes", "legacy-default")
+
+    def test_the_default_profile_is_still_offered_the_builtin_one(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.argv", ["hermes", "--mode", "selfhosted", "--host", "http://localhost:8888"])
+        _inject_fake_hermes_cli(monkeypatch)
+        monkeypatch.setattr("plugins.memory.mem0._setup._check_selfhosted_server", lambda h: None)
+        post_setup(str(tmp_path), {"memory": {}})
+        assert json.loads((tmp_path / "mem0.json").read_text(encoding="utf-8"))["agent_id"] == "hermes"
+
+
 class TestDryRun:
 
     def test_dry_run_flag_parsed(self):

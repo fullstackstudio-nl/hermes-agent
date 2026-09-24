@@ -4,7 +4,8 @@ Server-side fact extraction and semantic search via the Mem0 Platform API (cloud
 self-hosted Mem0 server (MEM0_HOST, HTTP), or OSS Memory. Secrets live in $HERMES_HOME/.env
 (MEM0_API_KEY, MEM0_HOST); settings in $HERMES_HOME/mem0.json via `hermes memory setup`:
 mode ("platform"|"oss"), host, user_id (canonical id across gateways; unset → gateway-native
-id), agent_id. MEM0_* env vars remain a fallback.
+id), agent_id (a named profile's own, written when the profile is made; see _identity). MEM0_* env vars
+remain a fallback.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider, spawn_context_thread
 from agent.secret_scope import get_secret
+from . import _identity
 from tools.registry import tool_error
 from utils import atomic_json_write, read_json_or_empty
 
@@ -92,7 +94,7 @@ def _load_config() -> dict:
     # A scope-less multiplex caller raises here on purpose — that is a spawn-site bug, and
     # swallowing it would silently route the turn's memories to the default profile.
     config = {"mode": get_secret("MEM0_MODE", "") or "platform", "host": get_secret("MEM0_HOST", "") or "",
-              "agent_id": get_secret("MEM0_AGENT_ID", "") or "hermes",
+              "agent_id": get_secret("MEM0_AGENT_ID", "") or _identity.LEGACY_AGENT_ID,
               # Read through the profile scope like agent_id: under multiplexing the name of a
               # profile's shared layer lives in that profile's own .env, not the process env.
               "shared_agent_id": get_secret("MEM0_SHARED_AGENT_ID", "") or _DEFAULT_SHARED_AGENT_ID,
@@ -218,15 +220,19 @@ class Mem0MemoryProvider(MemoryProvider):
     def save_config(self, values, hermes_home):
         """Merge-write config to $HERMES_HOME/mem0.json."""
         config_path = Path(hermes_home) / "mem0.json"
-        atomic_json_write(config_path, {**read_json_or_empty(config_path), **values}, mode=0o600)
+        before = read_json_or_empty(config_path)
+        merged = _identity.settle_saved_identity(hermes_home, before, {**before, **values})
+        atomic_json_write(config_path, merged, mode=0o600)
 
     def get_config_schema(self):
+        from hermes_constants import get_hermes_home
         api_key_required = _load_config().get("mode", "platform") != "oss"
         return [
             {"key": "api_key", "description": "Mem0 Platform API key", "secret": True, "required": api_key_required, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
             {"key": "host", "description": "Self-hosted Mem0 server URL (leave blank for cloud)", "required": False, "env_var": "MEM0_HOST"},
             {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
-            {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
+            # The dashboard form's default: never the default profile's identity for a named profile.
+            {"key": "agent_id", "description": "Agent identifier", "default": _identity.setup_default_agent_id(get_hermes_home())},
             {"key": "rerank", "description": "Enable reranking for recall", "default": "false", "choices": ["true", "false"]},
         ]
 
@@ -295,7 +301,12 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = cfg = _load_config()
-        self._mode, self._api_key, self._host, self._agent_id = cfg.get("mode", "platform"), cfg.get("api_key", ""), cfg.get("host", ""), cfg.get("agent_id", "hermes")
+        self._mode, self._api_key, self._host = cfg.get("mode", "platform"), cfg.get("api_key", ""), cfg.get("host", "")
+        # The "hermes" _load_config falls back to is the default profile's identity: a named profile
+        # never runs under it unannounced (_identity.resolve_agent_id).
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home()
+        self._agent_id = _identity.resolve_agent_id(cfg, home, env_agent_id=get_secret("MEM0_AGENT_ID", "") or "")
         # user_id precedence: operator-configured (env/mem0.json) > gateway-native id (kwargs) > _DEFAULT_USER_ID.
         # The literal placeholder counts as unset so wizard users still get gateway-native ids.
         configured = cfg.get("user_id")
