@@ -743,11 +743,33 @@ def _cmd_retry(rid, params, session, name, arg):
         except ValueError as exc:
             return _err(rid, 4018, str(exc))
         rewound, err = _rewind_or_err(
-            rid, session, len(user_indices) - 1, (4018, ""), "retry: failed to persist history: ", require_retryable=True)
+            rid, session, len(user_indices) - 1, (4018, ""), "retry: failed to persist history: ",
+            require_retryable=True, with_author=True)
         if err:
             return err
         content = cc.retryable_user_text(rewound[1].get("content"))
-    return _ok(rid, {"type": "send", "message": content})
+    # WHO PRESSED Retry, read here on the presser's own request context and carried explicitly.
+    return _submit_retried_turn(rid, params, session, content, rewound[3], _submitting_auth_user())
+
+
+def _submit_retried_turn(rid, params, session, content, author, presser):
+    """Run the retried turn on the gateway: WRITTEN by the rewound row's own author (or nobody), RUN as
+    the presser.
+
+    It used to answer ``{"type": "send", "message": content}`` and let the client resubmit the text --
+    from whichever connection pressed Retry, so ``prompt.submit`` stamped a colleague's question with
+    the presser's name, for good. The words never travel back through a client now. The turn acts as the
+    presser -- memory, tools, approvals, who the model is told is asking -- because somebody having sent
+    words once is not consent to run them again at another time on somebody else's action; the row names
+    the presser as ``replayed_by`` when that is not its author. The reply is a plain ``exec`` line, which
+    every client renders and none resubmits."""
+    from tui_gateway.row_author import ReplayedTurn
+    response = _methods["prompt.submit"](rid, {
+        "session_id": params.get("session_id") or "", "text": content,
+        "_replayed_turn": ReplayedTurn(author, presser)})
+    if "error" in response:
+        return response
+    return _exec_out(rid, "Retrying the last message.")
 
 
 def _cmd_steer(rid, params, session, name, arg):
@@ -755,8 +777,9 @@ def _cmd_steer(rid, params, session, name, arg):
         return _err(rid, 4004, "usage: /steer <prompt>")
     agent = session.get("agent") if session else None
     if agent and hasattr(agent, "steer"):
+        from tui_gateway.row_author import deliver_correction
         with contextlib.suppress(Exception):
-            if agent.steer(arg):
+            if deliver_correction(agent, "steer", arg, _submitting_auth_user()):
                 shown = f"{arg[:80]}{'...' if len(arg) > 80 else ''}"
                 return _exec_out(rid, f"⏩ Steer queued — arrives after the next tool call: {shown}")
     return _ok(rid, {"type": "send", "message": arg})  # no active run: next-turn message
@@ -823,6 +846,10 @@ def _cmd_undo(rid, params, session, name, arg):
         if err:
             return err
         turns_undone = min(n, len(user_indices))
+        # Only one's own words: the undone text lands in the presser's composer, one Send from being theirs.
+        from tui_gateway.row_author import undo_refusal
+        if refusal := undo_refusal([_history[i] for i in user_indices[-turns_undone:]], _submitting_auth_user()):
+            return _err(rid, 4018, refusal)
         rewound, err = _rewind_or_err(rid, session, len(user_indices) - turns_undone, (4004, "undo: "), "undo: ")
         if err:
             return err

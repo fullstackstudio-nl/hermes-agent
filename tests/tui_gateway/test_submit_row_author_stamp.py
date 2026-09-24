@@ -289,11 +289,13 @@ def turn_room(tmp_path, monkeypatch):
 
 def test_a_turn_writing_its_own_row_carries_its_submitter(turn_room):
     """A drained queued prompt is attributed to the person who sent it, not to whoever the session
-    was last used by."""
+    was last used by. The drain passes the envelope's submitter as the row's author explicitly: the
+    turn's scope identity alone authors nothing (test_replayed_turn_author.py)."""
     session, agent = turn_room
 
     assert server._run_prompt_submit(
-        "rid", "sid", session, "later", turn_auth_user=("oidc:user-b", "Sam")) is not False
+        "rid", "sid", session, "later", turn_auth_user=("oidc:user-b", "Sam"),
+        row_auth_user=("oidc:user-b", "Sam")) is not False
     assert agent.persisted_metadata == {"author": {"id": "oidc:user-b", "name": "Sam"}}
 
 

@@ -70,3 +70,91 @@ def with_row_author(display_metadata: dict | None, auth_user) -> dict | None:
     if author is None:
         return display_metadata
     return {**(display_metadata or {}), "author": author}
+
+
+def deliver_correction(agent, verb: str, text: str, submitter) -> bool:
+    """``agent.steer(text)`` / ``agent.redirect(text)`` with the sender handed in beside the text.
+
+    The agent keeps a steer's or redirect's author IN the pending slot with the text, under the slot's
+    own lock, and drains them together: onto the steer or redirect row it writes mid-turn, or back as
+    ``pending_steer_author`` when the text is handed back after the final answer. So the author can
+    never be paired with anybody else's words, whatever turns start or end in between. An agent whose
+    bound method takes no ``author=`` gets the bare text and names nobody, as does a submitter that
+    names no login."""
+    from agent.interrupt_control import accepts_author
+
+    method = getattr(agent, verb)
+    author = row_author(submitter)
+    if author is not None and accepts_author(method):
+        return method(text, author=author)
+    return method(text)
+
+
+def auth_user_from_row_author(author) -> tuple[str, str] | None:
+    """The ``(id, name)`` identity a row author was built from (:func:`row_author`'s inverse), or None
+    for anything that is not one."""
+    if not isinstance(author, dict) or not isinstance(author.get("id"), str) or not author["id"]:
+        return None
+    name = author.get("name")
+    return author["id"], name if isinstance(name, str) else ""
+
+
+class ReplayedTurn:
+    """``prompt.submit``'s in-process ``_replayed_turn``: a stored user row's own words run again by the
+    gateway (``/retry``). Two identities, kept apart as everywhere else: ``author`` (a :func:`row_author`
+    dict, or None for a row that named nobody) WROTE the words and is what the row says; ``presser`` (an
+    ``(id, name)`` identity, or None) asked for them to run again NOW and is who the turn acts as --
+    somebody having sent words once is not consent to run them again at another time on somebody else's
+    action. A JSON client cannot build one, so the handler accepts the object and refuses anything else."""
+
+    __slots__ = ("author", "presser")
+
+    def __init__(self, author: dict | None, presser: tuple[str, str] | None = None) -> None:
+        self.author = dict(author) if isinstance(author, dict) else None
+        self.presser = presser if isinstance(presser, tuple) and len(presser) == 2 and presser[0] else None
+
+    def __repr__(self) -> str:
+        return f"ReplayedTurn({self.author!r}, presser={self.presser!r})"
+
+
+def replayed_row_metadata(display_metadata: dict | None, author_auth_user, presser) -> dict | None:
+    """``display_metadata`` for a row carrying somebody's stored words again: ``author`` is who wrote them
+    (or nobody), and ``replayed_by`` names the presser when that is somebody else, so a reader can say
+    "Robin (retried by Sam)" instead of reading the row as sent by its author at that moment."""
+    rest = {key: value for key, value in (display_metadata or {}).items() if key not in ("author", "replayed_by")}
+    stamped = with_row_author(rest or None, author_auth_user)
+    by = row_author(presser)
+    if by is not None and by.get("id") != (row_author(author_auth_user) or {}).get("id"):
+        stamped = {**(stamped or {}), "replayed_by": by}
+    return stamped
+
+
+def undo_refusal(rows, presser) -> str | None:
+    """Why the presser may not undo ``rows``, or None. In a shared chat an undo deletes the row and hands
+    its words to the presser's composer, where one Send stores them as the presser's; so a row that names
+    anybody else is refused. A row that names nobody (a gateway that stamps nobody) is left as it was."""
+    from hermes_state_rewind import row_author_of
+
+    presser_id = (row_author(presser) or {}).get("id")
+    for row in rows:
+        author = row_author_of(row)
+        if author is not None and author.get("id") != presser_id:
+            return "You can only undo your own last message in a shared chat."
+    return None
+
+
+def resubmitted_row_identity(text, replaced_row: dict, replaced_live_view: dict, submitter):
+    """``(scope, row author, replay)`` for a submit that replaces a stored user row (rewind, edit,
+    regenerate); ``replay`` is True when it resends the row's own words. The turn always acts as the SENDER -- it is their action, now. Resending the row's OWN
+    words is a replay: the row stays its author's (or nobody's). New words over the sender's own row are
+    theirs. New words over somebody else's row -- or over a row that named nobody -- might be an edit or
+    a regenerate the client re-spelled; that is not provable, so the row names nobody."""
+    from agent.message_content import flatten_message_text
+    from hermes_state_rewind import row_author_of
+
+    original = row_author_of(replaced_row)
+    if isinstance(text, str) and text.strip() == flatten_message_text(replaced_live_view.get("content")).strip():
+        return submitter, auth_user_from_row_author(original), True
+    if original is not None and original == row_author(submitter):
+        return submitter, submitter, False
+    return submitter, None, False

@@ -1799,6 +1799,11 @@ def _(rid, params: dict, session: dict) -> dict:
         # Truncate from the last *real* user turn (not a timeline marker / compaction handoff).
         from agent.context_compressor import user_originated_turn_view
         if user_turns := sum(1 for message in history if user_originated_turn_view(message) is not None):
+            # Only one's own words in a shared chat (``undo_refusal``).
+            from tui_gateway.row_author import undo_refusal
+            last_user = next(m for m in reversed(history) if user_originated_turn_view(m) is not None)
+            if refusal := undo_refusal([last_user], _submitting_auth_user()):
+                return _err(rid, 4018, refusal)
             try:
                 removed = _rewind_active_session_history(session, user_turns - 1)[2]
             except Exception as exc:
@@ -2101,8 +2106,11 @@ def _(rid, params: dict) -> dict:
 def _apply_correction(rid, session: dict, verb: str, text: str, accepted_status: str) -> dict:
     """``agent.<verb>(text)``; on acceptance record it on the live turn (mid-turn resume rebuilds the bubble)
     and purge queued self-copies so post-turn drain cannot re-fire the old prompt."""
+    # Handed in with the text: the row it lands as -- mid-turn, or as its own turn when handed back after
+    # the final answer -- names the connection that sent it, not whoever's turn it arrived in.
+    from tui_gateway.row_author import deliver_correction
     try:
-        accepted = getattr(session["agent"], verb)(text)
+        accepted = deliver_correction(session["agent"], verb, text, _submitting_auth_user())
     except Exception as exc:
         return _err(rid, 5000, f"{verb} failed: {exc}")
     if accepted:
@@ -2131,7 +2139,8 @@ def _correction_method(name: str, verb: str, accepted_status: str, supported, un
         # Redirect during the turn-build window (running=True, agent None): queue for the next turn instead of
         # a misleading 4010 the client swallows into a lost follow-up.
         if verb == "redirect" and agent is None and session.get("running"):
-            _enqueue_prompt(session, text, current_transport() or _stdio_transport)
+            _enqueue_prompt(session, text, current_transport() or _stdio_transport,
+                            turn_auth_user=_submitting_auth_user())
             session["last_active"] = time.time()
             return _ok(rid, {"status": "queued", "text": text})
         if not supported(agent):

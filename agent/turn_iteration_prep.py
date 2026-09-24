@@ -14,7 +14,7 @@ import random
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from agent.display import KawaiiSpinner
 from agent.interrupt_control import interrupt_issuer
@@ -134,9 +134,7 @@ def prepare_iteration(
     # standalone user row after the newest tool result (never smeared onto the tool row: that
     # row is already persisted append-only, so replay would diverge from the live request and
     # break the prompt cache — same contract as apply_pending_steer_to_tool_results).
-    _pre_api_steer = agent._drain_pending_steer()
-    if _pre_api_steer:
-        _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer)
+    inject_pending_steer(agent, messages)
 
     # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, appended to the
     # newest tool result; off with no budget.
@@ -234,18 +232,47 @@ def _previous_tool_round(messages: Any) -> list:
     return []
 
 
-def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text: str) -> None:
+def inject_pending_steer(agent: Any, messages: Any) -> None:
+    """Drain a steer sent during the last API call, with its author, into this iteration."""
+    from agent.interrupt_control import drain_pending_with_author
+    steer_text, author = drain_pending_with_author(agent, "_drain_pending_steer")
+    if steer_text:
+        _inject_steer_after_newest_tool_result(agent, messages, steer_text, author)
+
+
+def apply_pending_redirect(agent: Any, messages: Any, apply: Any) -> Optional[str]:
+    """Drain the pending correction with its author and apply it via ``apply`` (the conversation loop's
+    ``_apply_active_turn_redirect``); returns the text applied, or None."""
+    from agent.interrupt_control import drain_pending_with_author
+    text, author = drain_pending_with_author(agent, "_drain_pending_redirect")
+    if text:
+        apply(agent, messages, text, author=author)
+    return text
+
+
+def requeue_unapplied_redirect(agent: Any) -> None:
+    """Hand a correction the turn could not apply back through the steer slot, keeping its author:
+    it becomes the next user turn (``result["pending_steer"]``) instead of being lost to
+    ``clear_interrupt()``, and is not re-attributed to whoever's turn it arrived in."""
+    from agent.interrupt_control import drain_pending_with_author, steer_with_author
+    unapplied, author = drain_pending_with_author(agent, "_drain_pending_redirect")
+    if unapplied:
+        steer_with_author(agent, unapplied, author)
+
+
+def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text: str,
+                                          author: Optional[Dict[str, Any]] = None) -> None:
     """Append the steer marker as a standalone user row after the newest tool message; with no
-    tool message, put the text back so the post-tool-execution drain delivers it later."""
+    tool message, put the text back (with its author) so the post-tool-execution drain delivers it later."""
     for _si in range(len(messages) - 1, -1, -1):
         _sm = messages[_si]
         if isinstance(_sm, dict) and _sm.get("role") == "tool":
             from agent.prompt_builder import steer_user_row
-            messages.insert(_si + 1, steer_user_row(steer_text))
+            messages.insert(_si + 1, steer_user_row(steer_text, author))
             logger.debug("Pre-API-call steer drain: appended user row after tool msg at index %d", _si)
             return
     from agent.agent_runtime_helpers import _requeue_pending_steer
-    _requeue_pending_steer(agent, steer_text)
+    _requeue_pending_steer(agent, steer_text, author)
 
 
 @dataclass
@@ -320,9 +347,8 @@ def begin_iteration(
             _turn_exit_reason=_turn_exit_reason,
         )
 
-    _redirect_text = agent._drain_pending_redirect()
+    _redirect_text = apply_pending_redirect(agent, messages, _apply_active_turn_redirect)
     if _redirect_text:
-        _apply_active_turn_redirect(agent, messages, _redirect_text)
         if isinstance(original_user_message, str):
             original_user_message = (
                 f"{original_user_message}\n\n" f"User correction during the turn: {_redirect_text}"
@@ -431,9 +457,7 @@ def apply_retry_restarts(
             )
             # The correction that tripped the cap was never applied; hand it back as the
             # next user turn (result["pending_steer"]) instead of losing it to clear_interrupt().
-            _unapplied = agent._drain_pending_redirect()
-            if _unapplied:
-                agent.steer(_unapplied)
+            requeue_unapplied_redirect(agent)
             return _verdict("break")
         # Cancelled request produced no valid assistant item: reuse the same logical
         # iteration after the outer loop appends partial context + correction.

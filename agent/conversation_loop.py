@@ -280,7 +280,8 @@ def _moa_reference_metrics_for_hook(agent: Any) -> Any:
         return None
 
 
-def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
+def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str,
+                                author: Optional[Dict[str, Any]] = None) -> None:
     """Append a provider-safe checkpoint and correction to the live turn so role alternation
     holds and cached messages stay byte-identical. INVARIANTS: raw chain-of-thought never enters
     replayable content (inlined CoT reads as a prefill jailbreak and bricks the session with
@@ -315,8 +316,12 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
             from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
             placeholder["api_content"] = _INTERRUPTED_PLACEHOLDER
         append_message(messages, placeholder)
-    # Transcript shows the user's own words; the provider replays the scaffolded form.
-    append_message(messages, {"role": "user", "content": text, "api_content": correction})
+    # Transcript shows the user's own words; the provider replays the scaffolded form. ``author`` is the
+    # one sender of every word of ``text``, when provable; otherwise the row names nobody.
+    correction_row: Dict[str, Any] = {"role": "user", "content": text, "api_content": correction}
+    if author:
+        correction_row["display_metadata"] = {"author": author}
+    append_message(messages, correction_row)
 
     # Stateful scrubber for <memory-context> spans split across stream deltas (#5719).  sanitize_context()
     # alone can't survive chunk boundaries because the block regex needs both tags in one string.

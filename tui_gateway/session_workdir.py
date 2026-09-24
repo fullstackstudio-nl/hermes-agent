@@ -445,10 +445,13 @@ def _session_db(session: dict):
 
 
 def _rewind_active_session_history(
-    session: dict, user_ordinal: int, *, require_retryable: bool = False) -> tuple[list[dict], dict, int]:
+    session: dict, user_ordinal: int, *, require_retryable: bool = False, with_author: bool = False) -> tuple:
     """Rewind one canonical user turn while retaining carrier scaffolding. Caller holds ``history_lock``. Persistent
     sessions go through ``SessionDB.rewind_user_turn`` (the durable transcript is the authority; memory is installed
-    only after the commit); a session without a key rewinds the warm history alone."""
+    only after the commit); a session without a key rewinds the warm history alone. ``(installed, live_view,
+    rewound_count)``, plus the rewound row's author (or None) when ``with_author`` -- a caller that replays the
+    row's words must attribute them to it, not to whoever asked for the replay."""
+    from hermes_state_rewind import row_author_of
     from agent.context_compressor import history_before_user_originated_turn, retryable_user_text, user_originated_turn_view
 
     history = _history_without_ephemeral_scaffolding(session.get("history", []))
@@ -464,8 +467,10 @@ def _rewind_active_session_history(
                 session_key, user_ordinal, warm_history=history, require_retryable=require_retryable,
                 adopt_row_ids=True)
         installed, live_view, rewound_count = outcome.prefix, outcome.live_view, outcome.rewound_count
+        author = outcome.author
     else:
         target_index = user_indices[user_ordinal]
+        author = row_author_of(history[target_index])
         installed, live_view = history_before_user_originated_turn(history, target_index)
         rewound_count = len(history) - target_index
         if require_retryable:
@@ -481,7 +486,7 @@ def _rewind_active_session_history(
             agent._last_flushed_db_idx = len(installed) if session_key else 0
         if hasattr(agent, "_db_flush_scan_prefix"):
             agent._db_flush_scan_prefix = installed[:] if session_key else None
-    return installed, live_view, rewound_count
+    return (installed, live_view, rewound_count, author) if with_author else (installed, live_view, rewound_count)
 
 
 def _history_without_ephemeral_scaffolding(history: list[dict]) -> list[dict]:

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import suppress
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.delegation_context import is_dispatcher_owned_worker_context
@@ -33,6 +33,18 @@ _SESSION_TOKEN_KEYS = (
     "reasoning_tokens", "prompt_tokens", "completion_tokens", "total_tokens",
 )
 _SESSION_COST_KEYS = ("estimated_cost_usd", "cost_status", "cost_source")
+
+
+def hand_back_leftover_steer(agent: Any, result: Dict[str, Any]) -> None:
+    """A /steer landing after the final assistant turn has no tool batch to drain into; hand it back
+    so it becomes the next user turn instead of being lost. Its sender rides along as
+    ``pending_steer_author`` only when every word of it came from that one person."""
+    from agent.interrupt_control import drain_pending_with_author
+    leftover, author = drain_pending_with_author(agent, "_drain_pending_steer")
+    if leftover:
+        result["pending_steer"] = leftover
+        if author:
+            result["pending_steer_author"] = author
 
 
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
@@ -661,11 +673,7 @@ def finalize_turn(
     # Cleanup failures are surfaced, but the response is returned either way (#8049).
     if _cleanup_errors:
         result["cleanup_errors"] = _cleanup_errors
-    # A /steer landing after the final assistant turn has no tool batch to drain into;
-    # hand it back so it becomes the next user turn instead of being lost.
-    _leftover_steer = agent._drain_pending_steer()
-    if _leftover_steer:
-        result["pending_steer"] = _leftover_steer
+    hand_back_leftover_steer(agent, result)
     agent._response_was_previewed = False
     if interrupted and agent._interrupt_message:
         result["interrupt_message"] = agent._interrupt_message

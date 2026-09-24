@@ -416,7 +416,8 @@ def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str
                             on_done=None, on_error=None, turn_auth_user=None) -> None:
     """Chain one follow-up turn (caller set ``running``); on failure run ``on_error``, log,
     release ``running``. The chained turn continues the work of whoever submitted the turn it follows,
-    so it is attributed to them and not re-resolved from the session record."""
+    so it is SCOPED to them (memory, tools, permissions) and not re-resolved from the session record.
+    It is not authored by them: nobody typed a continuation, so its row names no author."""
     try:
         _emit("message.start", sid)
         _run_prompt_submit(rid, sid, session, prompt, turn_auth_user=turn_auth_user)
@@ -439,9 +440,15 @@ def _run_post_turn_followups(
     notifications.  Each nested submit re-checks ``running`` under the lock."""
     steer = result.get("pending_steer") if isinstance(result, dict) else None
     if isinstance(steer, str) and steer.strip():
+        # WHO STEERED: the author the agent drained together with this exact text (``deliver_correction``),
+        # never ``turn_auth_user`` -- that is whoever submitted the turn the steer happened to arrive in,
+        # and in a shared chat a colleague steering somebody else's turn is the ordinary case. Text more
+        # than one person, or a connection naming no login, contributed to comes back with no author and
+        # is requeued under nobody's identity.
+        from tui_gateway.row_author import auth_user_from_row_author
+        steerer = auth_user_from_row_author(result.get("pending_steer_author"))
         with session["history_lock"]:
-            # The steer is that person's own words; requeue it under their identity, not the slot's.
-            _enqueue_prompt(session, steer, session.get("transport"), turn_auth_user=turn_auth_user)
+            _enqueue_prompt(session, steer, session.get("transport"), turn_auth_user=steerer)
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:
@@ -940,13 +947,16 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
     turn_author: dict | None = None,
-    turn_auth_user: tuple[str, str] | None = None) -> bool:
-    # WHO WROTE IT, for a turn that has to write its own user row: a prompt queued while the session
-    # was busy, or a submit whose submit-time write failed. prompt.submit already merged the author
-    # into the row it wrote, and merging again is the same value; a turn nobody submitted carries no
-    # identity here, so nothing is merged and its row names nobody.
+    turn_auth_user: tuple[str, str] | None = None,
+    row_auth_user: tuple[str, str] | None = None) -> bool:
+    # TWO identities. ``turn_auth_user`` is who the turn works FOR -- memory, tools, permissions -- and a
+    # turn nobody typed (the /goal continuation) still carries the person whose work it continues.
+    # ``row_auth_user`` is who TYPED this exact text, passed only by a caller that holds it beside the
+    # text: a prompt queued while the session was busy, drained with its envelope's own submitter. The
+    # row's author comes from that alone, never from the scope. prompt.submit merged its author into
+    # ``display_metadata`` already (and an isolated child receives it there, stamped by the parent).
     from tui_gateway.row_author import with_row_author
-    display_metadata = with_row_author(display_metadata, turn_auth_user)
+    display_metadata = with_row_author(display_metadata, row_auth_user)
     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by

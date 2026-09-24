@@ -4742,6 +4742,9 @@ Write only the summary body. Do not include any preamble or prefix."""
                 carrier.get("content"),
                 "\n\n" + _INFLIGHT_TASK_REPLAY_HEADER + "\n" + task_text,
             )
+            # The carrier now also holds the in-flight task's sender's words.
+            from agent.message_metadata import keep_shared_author
+            keep_shared_author(carrier, inflight)
             carrier[_INFLIGHT_REPLAY_MERGED_KEY] = True
             drop_stale_api_content(carrier)
             return compressed
@@ -5179,6 +5182,9 @@ Write only the summary body. Do not include any preamble or prefix."""
             )
         # Frontends use this to detect a summary-prefixed message.
         msg[COMPRESSED_SUMMARY_METADATA_KEY], msg[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] = True, bool(self._summary_has_user_turn)
+        # The row now also carries the model's summary, which paraphrases everyone: no one person wrote it.
+        from agent.message_metadata import keep_shared_author
+        keep_shared_author(msg, None)
         # Rewritten content: drop the stale api_content sidecar so replay can't resend pre-merge bytes.
         drop_stale_api_content(msg)
 

@@ -24,6 +24,17 @@ class RewindOutcome:
     live_text: str  # lossless retry text when ``require_retryable``, else the display flattening (prefill)
     rewound_count: int
     turns_undone: int
+    # ``display_metadata["author"]`` of the rewound row, read from the durable row (after the same alternation
+    # repair the live replay runs, which keeps an author only when every joined row shared it); None when it
+    # names nobody. A replay of the row's own words is attributed to this, never to whoever asked for it.
+    author: Optional[Dict[str, Any]] = None
+
+
+def row_author_of(message: Any) -> Optional[Dict[str, Any]]:
+    """The ``display_metadata["author"]`` a stored row names, or None."""
+    metadata = message.get("display_metadata") if isinstance(message, dict) else None
+    author = metadata.get("author") if isinstance(metadata, dict) else None
+    return dict(author) if isinstance(author, dict) and author.get("id") else None
 
 
 def _user_indices(messages: List[Dict[str, Any]]) -> List[int]:
@@ -126,4 +137,5 @@ class SessionRewindMixin:
         return RewindOutcome(
             prefix=prefix, live_view=live_view,
             live_text=live_text if live_text is not None else flatten_message_text(live_view.get("content")),
-            rewound_count=int(result.get("rewound_count", 0)), turns_undone=len(durable_user) - user_ordinal)
+            rewound_count=int(result.get("rewound_count", 0)), turns_undone=len(durable_user) - user_ordinal,
+            author=row_author_of(target))

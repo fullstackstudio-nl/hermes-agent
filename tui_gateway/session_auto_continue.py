@@ -134,14 +134,17 @@ def _ac_inflight_original(session: dict) -> str:
 
 
 def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[str] | None = None,
-                    turn_author: dict | None = None, turn_auth_user: tuple[str, str] | None = None) -> None:
+                    turn_author: dict | None = None, turn_auth_user: tuple[str, str] | None = None,
+                    row_metadata: dict | None = None) -> None:
     """Queue a message for the next turn. Text-only arrivals share a slot and merge losslessly (like the
     consecutive-user merge in ``repair_message_sequence``); image-bearing and authored ones stay separate
     envelopes so attachment chronology and the sender survive. ``transport`` is pinned so the drained turn
     streams to its sender, and ``turn_auth_user`` -- the signed-in identity of the connection that sent it
     -- so the drained turn is attributed to that person and not to whoever the session was last used by.
     Two PEOPLE's messages never merge into one envelope: the one turn they would become could only be
-    attributed to one of them."""
+    attributed to one of them. ``row_metadata`` is a replay's own row metadata (its author and
+    ``replayed_by``): the row then says who WROTE the words while ``turn_auth_user`` is who the turn acts
+    as, and such an envelope never merges with another."""
     image_paths = list(image_paths or [])
     # Scrub live-turn self-duplicates first so the text merge below can't glue "{original}\n\n{later}" and re-fire the
     # original after a correction settles.
@@ -149,13 +152,15 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any, image_paths: list[
     _drop_queued_duplicates_of_inflight_user(session)
     text_only = not image_paths and isinstance(text, str)
     # A text-only self-copy of the live prompt would restart it on drain; an authored copy is another sender's message.
-    if text_only and not turn_author and text.strip() == _ac_inflight_original(session) != "":
+    if text_only and not turn_author and row_metadata is None and text.strip() == _ac_inflight_original(session) != "":
         return
     queued = {"text": text, "transport": transport, **({"image_paths": image_paths} if image_paths else {}),
               **({"turn_author": turn_author} if turn_author else {}),
-              **({"turn_auth_user": turn_auth_user} if turn_auth_user else {})}
+              **({"turn_auth_user": turn_auth_user} if turn_auth_user else {}),
+              **({"row_metadata": row_metadata} if row_metadata is not None else {})}
     existing = session.get("queued_prompt")
-    if (existing and text_only and not turn_author and isinstance(existing.get("text"), str)
+    if (existing and text_only and not turn_author and row_metadata is None and "row_metadata" not in existing
+            and isinstance(existing.get("text"), str)
             and not existing.get("image_paths") and not existing.get("turn_author")
             and existing.get("turn_auth_user") == turn_auth_user
             and not session.get("queued_prompts")):
@@ -234,12 +239,15 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
 
 
-def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: str, status: str) -> dict | None:
+def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: str, status: str,
+                       submitter: tuple[str, str] | None = None) -> dict | None:
     """Apply ``agent.<method>(plain_text)`` (steer/redirect); on acceptance record the correction, scrub stale
     self-duplicates so the live turn's original text is not re-fired after settle, and return the ``status`` reply.
-    None → caller falls through to the queue path."""
+    None → caller falls through to the queue path. ``submitter`` is handed to the agent with the text, so the
+    row it lands as -- mid-turn, or as its own turn when handed back -- names the person who typed it."""
+    from tui_gateway.row_author import deliver_correction
     try:
-        if not getattr(agent, method)(plain_text):
+        if not deliver_correction(agent, method, plain_text, submitter):
             return None
     except Exception:
         return None
@@ -252,7 +260,8 @@ def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: 
 
 def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False,
                         turn_author: dict | None = None,
-                        turn_auth_user: tuple[str, str] | None = None) -> dict | None:
+                        turn_auth_user: tuple[str, str] | None = None,
+                        row_metadata: dict | None = None) -> dict | None:
     """Apply ``display.busy_input_mode`` to a mid-turn prompt instead of rejecting it (rejection made clients busy-retry
     and drop sends): ``interrupt`` (default) → redirect, falling back to hard interrupt + queue; ``queue`` → queue only;
     ``steer`` → inject after the current atomic action. ``queued=True`` (client queue drain) forces queue mode: a "run
@@ -274,7 +283,8 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
             "interrupt": getattr(agent, "_supports_active_turn_redirect", False) is True and hasattr(agent, "redirect")}
         method, status = {"steer": ("steer", "steered"), "interrupt": ("redirect", "redirected")}.get(mode, (None, None))
         if (method and supported[mode]
-                and (resp := _ac_try_correction(rid, session, agent, method, plain_text, status)) is not None):
+                and (resp := _ac_try_correction(
+                    rid, session, agent, method, plain_text, status, submitter=turn_auth_user)) is not None):
             return resp
     # Queue before asking the live turn to stop. Never call a provider/compute-host method under history_lock: an
     # interrupt can wait behind the op it cancels.
@@ -284,7 +294,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
         _enqueue_prompt(session, text, transport, image_paths=image_paths, turn_author=turn_author,
-                        turn_auth_user=turn_auth_user)
+                        turn_auth_user=turn_auth_user, row_metadata=row_metadata)
         session["last_active"] = time.time()
     # Attachments need their own model invocation: queue without cancelling so the user gets both results in order.
     # ``steer`` must NEVER escalate to a hard interrupt: it would kill the live turn AND drop ``AIAgent._pending_steer``
@@ -327,17 +337,35 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     kwargs: dict = {"queued_prompt_generation": queue_generation}
     if queued.get("image_paths"):
         kwargs["image_paths"] = queued["image_paths"]
-    # The compute-host frame has no author field, so only the inline runner receives it.
+    # The compute-host frame has no field for either author, so only the inline runner receives them;
+    # the isolated runner gets the row's author in ``display_metadata`` instead.
     author_kwargs = {"turn_author": queued["turn_author"]} if queued.get("turn_author") else {}
     # The envelope's own submitter, not the contextvar: this runs on the thread of the turn that just
-    # finished, which is somebody else's turn as often as not.
-    if queued.get("turn_auth_user"):
-        kwargs["turn_auth_user"] = tuple(queued["turn_auth_user"])
+    # finished, which is somebody else's turn as often as not. It is both the scope of the drained turn
+    # and the author of its row -- the envelope is the one place the text and its sender are held
+    # together. An envelope that names nobody authors nothing, on either runner.
+    submitter = tuple(queued["turn_auth_user"]) if queued.get("turn_auth_user") else None
+    if submitter:
+        kwargs["turn_auth_user"] = submitter
+    # The isolated child only learns the frame's SCOPE identity, which the parent resolves from the session
+    # record for an envelope that names nobody -- so the row's author is stamped here, or not at all. A
+    # replay carries its own row metadata (who wrote it, who replayed it) apart from its scope.
+    from tui_gateway.row_author import with_row_author
+    if "row_metadata" in queued:
+        metadata = queued.get("row_metadata")
+        if metadata:
+            author_kwargs["display_metadata"] = metadata
+    else:
+        metadata = with_row_author(None, submitter)
+        if submitter:
+            author_kwargs["row_auth_user"] = submitter
+    isolated_kwargs = {"display_metadata": metadata} if metadata else {}
     dispatch_failed = False
     try:
         if not use_compute_host:
             _run_prompt_submit(rid, sid, session, queued["text"], **kwargs, **author_kwargs)
-        elif (resp := _submit_prompt_to_compute_host(rid, sid, session, queued["text"], **kwargs)).get("error"):
+        elif (resp := _submit_prompt_to_compute_host(
+                rid, sid, session, queued["text"], **kwargs, **isolated_kwargs)).get("error"):
             with session["history_lock"]:
                 session["running"] = False
                 _clear_inflight_turn(session)

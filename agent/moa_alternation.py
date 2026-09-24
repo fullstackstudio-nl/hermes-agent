@@ -46,6 +46,8 @@ def merge_same_role_messages(messages: list[dict[str, Any]]) -> list[dict[str, A
             merged.append(message)
             continue
         merged[-1] = {**prev, "content": content}
+        from agent.message_metadata import keep_shared_author
+        keep_shared_author(merged[-1], message)
         changed = True
     return merged if changed else messages
 

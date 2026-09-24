@@ -379,15 +379,17 @@ def _row_ids_of(messages) -> set:
     return {row_id for message in messages if isinstance((row_id := _message_row_id(message)), int)}
 
 
-def _truncate_history_for_submit(rid, sid, session, params, requested_rebind_ids):
+def _truncate_history_for_submit(rid, sid, session, params, requested_rebind_ids, cut_out: dict | None = None):
     """Rewind/regenerate cut under ``history_lock``: ``(err, survivor_fields)``; the fields
-    are the client rowId-rebind payload."""
+    are the client rowId-rebind payload. ``cut_out`` receives the replaced row and its live view."""
     history = _history_without_ephemeral_scaffolding(session.get("history", []))
     ordinal, cut_index, err = _resolve_truncation_ordinal(rid, sid, session, params, history)
     if err is not None:
         return err, {}
     from agent.context_compressor import history_before_user_originated_turn
     truncated, _live_view = history_before_user_originated_turn(history, cut_index)
+    if cut_out is not None:
+        cut_out.update(row=history[cut_index], live_view=_live_view)
     # Second gate: ordinal 0 would DELETE every durable row; wiping needs its own opt-in.
     if not truncated and history and not is_truthy_value(params.get("confirm_empty_truncate")):
         logger.warning(
@@ -554,7 +556,8 @@ _TRUNCATION_PARAMS = (
 
 
 def _lock_in_submit_turn(
-    rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind):
+    rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind,
+    cut_out: dict | None = None):
     """Under ``history_lock``: refuse watch-child races / malformed truncation, apply the
     cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
     fields = {}
@@ -572,7 +575,7 @@ def _lock_in_submit_turn(
             ), fields
         if has_truncation:
             err, fields = _truncate_history_for_submit(
-                rid, sid, session, params, requested_rebind_ids)
+                rid, sid, session, params, requested_rebind_ids, cut_out)
             if err is not None:
                 return err, {}
         session["running"] = True
@@ -626,13 +629,23 @@ def _(rid, params: dict) -> dict:
     # and reach neither this value nor the author fence above. An INTERNAL dispatch (the relay, a hosted
     # room) arrives on a socket that belongs to whoever relayed it, not to the author, and names nobody.
     submitter = _submit_auth_user(params)
+    row_submitter = submitter
+    # A stored row's own words run again (``/retry``): the row is its author's, the turn acts as whoever
+    # pressed Retry. Built in-process only; a client value is refused.
+    from tui_gateway.row_author import ReplayedTurn, auth_user_from_row_author
+    replayed = params.get("_replayed_turn")
+    if replayed is not None:
+        if not isinstance(replayed, ReplayedTurn):
+            return _err(rid, 4124, "a replayed turn's author is stamped by the gateway, never by a client")
+        submitter, row_submitter = replayed.presser, auth_user_from_row_author(replayed.author)
     # WHO WROTE IT, on the row itself. The live path cannot say: message.start carries no payload and
     # two clients on one session share a FanoutTransport, so a client never learns from the socket
     # that somebody else typed anything -- it reads the row back afterwards, by which time every live
     # signal is gone. So the author is stamped from the same identity the turn is attributed to, which
     # means an internally dispatched turn stamps nobody, exactly as it attributes nobody.
-    from tui_gateway.row_author import with_row_author
-    display_metadata = with_row_author(display_metadata, submitter)
+    from tui_gateway.row_author import replayed_row_metadata, with_row_author
+    display_metadata = (replayed_row_metadata(display_metadata, row_submitter, submitter) if replayed is not None
+                        else with_row_author(display_metadata, submitter))
     hosted_task = params.get("_hosted_task")
     hosted_terminal_callback = params.get("_hosted_terminal_callback")
     internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
@@ -689,19 +702,31 @@ def _(rid, params: dict) -> dict:
             # built for exactly this race — see desktop's `runRewindSubmit`) waits
             # for `running` to clear and resubmits with the truncation intact.
             return _err(rid, 4009, "session busy")
+        # A replay never becomes a live steer or redirect (those rows would name the presser); it queues,
+        # carrying its row's metadata apart from the presser who is its scope.
         busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author,
-            turn_auth_user=submitter)
+            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")) or replayed is not None,
+            turn_author=turn_author, turn_auth_user=submitter,
+            row_metadata=display_metadata if replayed is not None else None)
         if busy_response is not None:
             return busy_response
     raw_rebind_ids = params.get("rebind_survivor_row_ids")
     requested_rebind_ids = (
         {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
         if isinstance(raw_rebind_ids, list) else None)
+    replaced: dict = {}
     err, survivor_fields = _lock_in_submit_turn(
-        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
+        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind,
+        cut_out=replaced)
     if err is not None:
         return err
+    if replaced:
+        # A rewind / edit / regenerate replaced a stored row. Its own words sent again are that row's
+        # author's, whoever pressed the button (``resubmitted_row_identity``).
+        from tui_gateway.row_author import resubmitted_row_identity
+        submitter, row_submitter, replay = resubmitted_row_identity(
+            text, replaced["row"], replaced["live_view"], submitter)
+        display_metadata = replayed_row_metadata(display_metadata, row_submitter, submitter if replay else None)
     if turn_isolation:
         if turn_author:
             logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",

@@ -49,6 +49,8 @@ class PromptSubmitParams(SessionParams):
     turn_author: JsonValue | None = Field(default=None, exclude=True, alias="_turn_author")
     hosted_terminal_callback: JsonValue | None = Field(
         default=None, exclude=True, alias="_hosted_terminal_callback")
+    # In-process only: ``/retry`` running a stored row's words again under that row's own author.
+    replayed_turn: JsonValue | None = Field(default=None, exclude=True, alias="_replayed_turn")
 
 
 class PromptSubmitStatus(WireEnum):

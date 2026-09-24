@@ -416,6 +416,9 @@ class MicroCompactionMixin:
             prev = merged[-1] if merged else None
             if _plain_user(msg) and _plain_user(prev):
                 prev["content"] = "\n\n".join(c for c in (prev["content"], msg["content"]) if c)
+                if msg["content"]:
+                    from agent.message_metadata import keep_shared_author
+                    keep_shared_author(prev, msg)  # an author only if both rows share it
                 drop_stale_api_content(prev)  # merged content invalidates the api_content sidecar
                 # The merge rewrites a live dict that may carry _db_persisted: pop the stamp
                 # and flag the finalizer to invalidate the bounded flush-scan cursor, or the

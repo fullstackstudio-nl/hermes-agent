@@ -4,9 +4,10 @@ Soft/hard interrupt requests, tool-thread interrupt propagation, pending steer/r
 Extracted from ``run_agent.py``; every method resolves through ``AIAgent``'s MRO unchanged.
 """
 import contextlib
+import inspect
 import logging
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 from agent.interrupt_compat import request_hard_interrupt
 from tools.interrupt import request_yield as _request_yield
@@ -103,8 +104,79 @@ def _ic_signal_tool_workers(agent, active: bool, **kw) -> None:
             pass
 
 
+# WHO SENT the text waiting in a pending slot. A surface that knows the sender of a steer or redirect
+# (the TUI gateway: the signed-in connection that sent it) hands ``author`` in with the text; the slot then
+# keeps, beside its text, the exact text it recorded and one marker per contribution. Pending text is
+# joined into one string and drained whole, so the drained text is attributed only when every contribution
+# came from the same author AND the recorded text is still exactly what is being drained -- a slot written
+# any other way (a test stub, a surface that never passes an author) simply yields no author. Author and
+# text change together under the slot's lock, so no drain, requeue or turn boundary can pair one person's
+# words with another's name. The author is opaque here: it only ever becomes the row's
+# ``display_metadata["author"]``.
+_STEER_AUTHORS = "_pending_steer_authors"
+_REDIRECT_AUTHORS = "_pending_redirect_authors"
+
+
+def _joined_author(record: Any, text: Any) -> Optional[dict]:
+    """The single author every contribution to ``text`` came from, or None when that is not provable."""
+    if not text or not isinstance(record, tuple) or len(record) != 2 or record[0] != text:
+        return None
+    markers = record[1]
+    first = markers[0] if markers else None
+    return first if isinstance(first, dict) and all(m == first for m in markers) else None
+
+
+def _author_markers(record: Any, existing: Any) -> list:
+    """Markers already standing for ``existing`` pending text; text the record does not account for
+    counts as one contribution from nobody."""
+    if not existing:
+        return []
+    if isinstance(record, tuple) and len(record) == 2 and record[0] == existing:
+        return list(record[1])
+    return [None]
+
+
+def append_pending_text(agent, slot: str, record_attr: str, text: str, separator: str,
+                        author: Optional[dict]) -> None:
+    """Append ``text`` (from ``author``, or None) to a pending slot. Caller holds the slot's lock."""
+    existing = getattr(agent, slot, None)
+    joined = f"{existing}{separator}{text}" if existing else text
+    markers = _author_markers(getattr(agent, record_attr, None), existing) + [author if isinstance(author, dict) else None]
+    setattr(agent, slot, joined)
+    setattr(agent, record_attr, (joined, markers))
+
+
+def accepts_author(method: Any) -> bool:
+    """True when ``method`` (a resolved ``steer`` / ``redirect``) takes an ``author=`` keyword. Checked on
+    the method actually bound, not on a class flag: a subclass that overrides ``steer(self, text)``
+    without it must get the bare text, not a TypeError."""
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    param = parameters.get("author")
+    return (param is not None and param.kind in (param.KEYWORD_ONLY, param.POSITIONAL_OR_KEYWORD)) or any(
+        p.kind is p.VAR_KEYWORD for p in parameters.values())
+
+
+def steer_with_author(agent: Any, text: str, author: Optional[dict]) -> bool:
+    """``agent.steer(text)``, handing ``author`` in only when there is one and the bound ``steer`` takes it."""
+    if author and accepts_author(agent.steer):
+        return agent.steer(text, author=author)
+    return agent.steer(text)
+
+
+def drain_pending_with_author(agent, drain_name: str) -> tuple:
+    """``(text, author)`` from ``agent.<drain_name>_entry()`` when the agent's class carries authors, else
+    ``(agent.<drain_name>(), None)`` -- stubs and third-party agents drain as before and name nobody."""
+    if callable(getattr(type(agent), f"{drain_name}_entry", None)):
+        return getattr(agent, f"{drain_name}_entry")()
+    return getattr(agent, drain_name)(), None
+
+
 class InterruptControlMixin:
     """interrupt()/hard_interrupt()/clear_interrupt()/steer()/redirect() (see module docstring)."""
+
 
     def interrupt(
         self, message: Optional[str] = None, *, hard_cancel: bool = False,
@@ -170,6 +242,7 @@ class InterruptControlMixin:
                 _fence(), when_in_flight=False, failure_log="Compression hard-cancel fence admission failed"
             )
             self._pending_redirect = None
+            setattr(self, _REDIRECT_AUTHORS, None)
 
         # Codex watches a private interrupt event rather than Hermes' per-thread flag.
         _request_interrupt = _ic_codex_method(self, "request_interrupt")
@@ -229,6 +302,7 @@ class InterruptControlMixin:
             getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
             if not preserve_redirect:
                 self._pending_redirect = None
+                setattr(self, _REDIRECT_AUTHORS, None)
         self._interrupt_thread_signal_pending = False
         if self._execution_thread_id is not None:
             _set_interrupt(False, self._execution_thread_id)
@@ -239,20 +313,22 @@ class InterruptControlMixin:
             # hard_cancel, so a soft clear dropped a live user message with no trace.
             with _ic_lock(self, "_pending_steer_lock"):
                 self._pending_steer = None
+                setattr(self, _STEER_AUTHORS, None)
         return True
 
-    def steer(self, text: str) -> bool:
+    def steer(self, text: str, *, author: Optional[dict] = None) -> bool:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no
-        interrupt); multiple calls concatenate with newlines. Returns False for empty text."""
+        interrupt); multiple calls concatenate with newlines. Returns False for empty text. ``author``
+        is who sent it, when the surface knows (see ``_joined_author``)."""
         if not text or not text.strip():
             return False
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
-            existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
-            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            _ic_slot(self, "_pending_steer_lock", "_pending_steer")  # fail loud on a half-built agent
+            append_pending_text(self, "_pending_steer", _STEER_AUTHORS, cleaned, "\n", author)
         return True
 
-    def redirect(self, text: str) -> bool:
+    def redirect(self, text: str, *, author: Optional[dict] = None) -> bool:
         """Redirect the active turn without converting it into a new task: during a model request only that
         request is cancelled (completed messages kept, partial reasoning becomes assistant context, the
         correction is appended as a real user message, the loop retries); during tool execution it degrades
@@ -277,7 +353,7 @@ class InterruptControlMixin:
         # `sleep` poller, a build), so ask the tool workers to YIELD: terminal hands the live
         # process to the background registry and returns; tools that don't yield are unaffected.
         if getattr(self, "_executing_tools", False):
-            accepted = self.steer(cleaned)
+            accepted = steer_with_author(self, cleaned, author)
             if accepted:
                 tracker = getattr(self, "_tool_worker_threads", None)
                 tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
@@ -295,9 +371,8 @@ class InterruptControlMixin:
             existing = _ic_slot(self, "_pending_redirect_lock", "_pending_redirect")
             if self._interrupt_requested and not existing:
                 return False
-            self._pending_redirect = (
-                f"{existing}\n\n[Additional user correction]\n{cleaned}" if existing else cleaned
-            )
+            append_pending_text(
+                self, "_pending_redirect", _REDIRECT_AUTHORS, cleaned, "\n\n[Additional user correction]\n", author)
             self._interrupt_requested = True
             self._interrupt_message = None
 
@@ -318,14 +393,26 @@ class InterruptControlMixin:
 
     def _drain_pending_redirect(self) -> Optional[str]:
         """Return and clear pending active-turn correction text."""
+        return InterruptControlMixin._drain_pending_redirect_entry(self)[0]
+
+    def _drain_pending_redirect_entry(self) -> tuple:
+        """``(text, author)`` of the pending correction, cleared together; author None unless provable."""
         with _ic_lock(self, "_pending_redirect_lock"):
             text = _ic_slot(self, "_pending_redirect_lock", "_pending_redirect")
+            author = _joined_author(getattr(self, _REDIRECT_AUTHORS, None), text)
             self._pending_redirect = None
-        return text
+            setattr(self, _REDIRECT_AUTHORS, None)
+        return text, author
 
     def _drain_pending_steer(self) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot; None when nothing is pending."""
+        return InterruptControlMixin._drain_pending_steer_entry(self)[0]
+
+    def _drain_pending_steer_entry(self) -> tuple:
+        """``(text, author)`` of the pending steer, cleared together; author None unless provable."""
         with _ic_lock(self, "_pending_steer_lock"):
             text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
+            author = _joined_author(getattr(self, _STEER_AUTHORS, None), text)
             self._pending_steer = None
-        return text
+            setattr(self, _STEER_AUTHORS, None)
+        return text, author

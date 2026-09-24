@@ -575,6 +575,10 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
             )
             had_api_sidecar = "api_content" in prev
             prev["content"] = merged_content
+            if new_content:
+                # The row now holds a second sender's words: it keeps an author only if both share it.
+                from agent.message_metadata import keep_shared_author
+                keep_shared_author(prev, msg)
             # Merged content invalidates the api_content sidecar; drop it so replay cannot use stale bytes.
             drop_stale_api_content(prev)
             # Pop the persist marker only when the durable row actually changed: a merge that
@@ -1104,6 +1108,8 @@ def drop_thinking_only_and_merge_users(
             merged.append(m)
         else:
             merged[-1] = {**prev, "content": content}  # copy so caller dicts are never mutated
+            from agent.message_metadata import keep_shared_author
+            keep_shared_author(merged[-1], m)
             merges += 1
     if dropped == 0 and merges == 0:
         return messages
@@ -3447,21 +3453,20 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
     return context
 
 
-def _requeue_pending_steer(agent, steer_text: str) -> None:
-    """Put drained steer text back so the caller's fallback delivers it as a next-turn user message."""
+def _requeue_pending_steer(agent, steer_text: str, author: Optional[Dict[str, Any]] = None) -> None:
+    """Put drained steer text back so the caller's fallback delivers it as a next-turn user message,
+    with the author it was drained with (None when it had no single provable one)."""
+    from agent.interrupt_control import append_pending_text
     # Under the lock the slot is read directly: an initialized agent always has both attributes, so a
     # missing ``_pending_steer`` there is a real bug and must fail loud. The lock-less branch only
     # exists for test stubs built via ``object.__new__`` that skipped ``__init__``.
     _lock = getattr(agent, "_pending_steer_lock", None)
     if _lock is not None:
         with _lock:
-            if agent._pending_steer:
-                agent._pending_steer = agent._pending_steer + "\n" + steer_text
-            else:
-                agent._pending_steer = steer_text
+            agent._pending_steer  # noqa: B018 -- fail loud on a half-built agent
+            append_pending_text(agent, "_pending_steer", "_pending_steer_authors", steer_text, "\n", author)
     else:
-        existing = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+        append_pending_text(agent, "_pending_steer", "_pending_steer_authors", steer_text, "\n", author)
 
 
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
@@ -3486,7 +3491,8 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     """
     if num_tool_msgs <= 0 or not messages:
         return
-    steer_text = agent._drain_pending_steer()
+    from agent.interrupt_control import drain_pending_with_author
+    steer_text, steer_author = drain_pending_with_author(agent, "_drain_pending_steer")
     if not steer_text:
         return
     # Skip non-tool messages in the tail in case something else is appended at the boundary.
@@ -3496,9 +3502,9 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         # No tool result in this batch (e.g. all skipped by interrupt);
         # requeue so the fallback path delivers it as a normal next-turn
         # user message (which persists like any other user turn).
-        _requeue_pending_steer(agent, steer_text)
+        _requeue_pending_steer(agent, steer_text, steer_author)
         return
-    messages.append(steer_user_row(steer_text))
+    messages.append(steer_user_row(steer_text, steer_author))
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
