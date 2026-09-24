@@ -290,3 +290,81 @@ def test_missing_slot_stays_an_error_outside_the_repair_case(
     assert mgr.registered == []
     assert mgr.calls == []
     assert "no such gateway 'coder'" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# HERM-131: HERMES_MESSAGING_GATEWAY=off refuses a start with an explanation
+# ---------------------------------------------------------------------------
+
+
+def test_start_refuses_and_explains_when_messaging_gateway_is_off(monkeypatch, capsys):
+    """`hermes gateway start` (default or named profile) must not silently un-down the s6 slot that
+    02-reconcile-profiles deliberately left down; it explains the container-level switch instead."""
+    from hermes_cli import gateway as gw
+    from hermes_cli import service_manager as sm
+
+    rec = _CallRecorder()
+    monkeypatch.setattr(sm, "detect_service_manager", lambda: "s6")
+    monkeypatch.setattr(sm, "get_service_manager", lambda: rec)
+    monkeypatch.setenv("HERMES_MESSAGING_GATEWAY", "off")
+
+    with pytest.raises(SystemExit) as excinfo:
+        gw._dispatch_via_service_manager_if_s6("start", "coder")
+
+    assert excinfo.value.code == 1
+    assert rec.calls == [], "must not touch the s6 slot at all"
+    out = capsys.readouterr().out
+    assert "HERMES_MESSAGING_GATEWAY=off" in out
+    assert "messaging gateway off" in out.lower()
+
+
+def test_stop_and_restart_are_unaffected_by_messaging_gateway_off(monkeypatch):
+    """The switch only gates starting a new gateway; stop/restart of whatever happens to be up
+    (e.g. started before the switch was flipped on) must keep working normally."""
+    from hermes_cli import gateway as gw
+    from hermes_cli import service_manager as sm
+
+    rec = _CallRecorder()
+    monkeypatch.setattr(sm, "detect_service_manager", lambda: "s6")
+    monkeypatch.setattr(sm, "get_service_manager", lambda: rec)
+    monkeypatch.setenv("HERMES_MESSAGING_GATEWAY", "off")
+
+    assert gw._dispatch_via_service_manager_if_s6("stop", "coder") is True
+    assert gw._dispatch_via_service_manager_if_s6("restart", "coder") is True
+    assert rec.calls == [("stop", "gateway-coder"), ("restart", "gateway-coder")]
+
+
+def test_start_is_unaffected_when_messaging_gateway_is_on_or_unset(monkeypatch):
+    """No behaviour change for an operator who never set the variable, or set it explicitly to on."""
+    from hermes_cli import gateway as gw
+    from hermes_cli import service_manager as sm
+
+    for value in (None, "on"):
+        rec = _CallRecorder()
+        monkeypatch.setattr(sm, "detect_service_manager", lambda: "s6")
+        monkeypatch.setattr(sm, "get_service_manager", lambda: rec)
+        if value is None:
+            monkeypatch.delenv("HERMES_MESSAGING_GATEWAY", raising=False)
+        else:
+            monkeypatch.setenv("HERMES_MESSAGING_GATEWAY", value)
+
+        assert gw._dispatch_via_service_manager_if_s6("start", "coder") is True
+        assert rec.calls == [("start", "gateway-coder")]
+
+
+def test_run_redirect_refuses_when_messaging_gateway_is_off(monkeypatch, capsys):
+    """The legacy `gateway run` -> supervised-longrun redirect funnels through the same dispatcher
+    and must refuse the same way, rather than falling through to a foreground gateway run."""
+    from hermes_cli import gateway as gw
+
+    _stub_s6(monkeypatch, on_s6=True)
+    monkeypatch.setattr("hermes_cli.gateway._profile_suffix", lambda: "")
+    monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_NO_SUPERVISE", raising=False)
+    monkeypatch.setenv("HERMES_MESSAGING_GATEWAY", "off")
+
+    with pytest.raises(SystemExit) as excinfo:
+        gw._maybe_redirect_run_to_s6_supervision(_Args())
+
+    assert excinfo.value.code == 1
+    assert "HERMES_MESSAGING_GATEWAY=off" in capsys.readouterr().out

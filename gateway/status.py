@@ -154,9 +154,40 @@ _runtime_status_state: Optional[dict[str, Any]] = None
 def _merge_over_on_disk(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
     """Lay the canonical snapshot over whatever is on disk right before writing. Out-of-process
     writers (the migration's compensator clearing multiplex-owned status, container_boot
-    seeding ``desired_state``) stamp this file directly; the gateway's fields win, theirs survive."""
+    seeding ``desired_state``) stamp this file directly; the gateway's fields win, theirs survive.
+
+    That only holds for a key ``payload`` does not carry at all: this merge cannot tell "the gateway
+    never had an opinion on this field" from "the gateway's opinion happens to match what it read at
+    boot". ``payload`` is a deep copy of the process-wide ``_runtime_status_state``, which is loaded
+    from disk ONCE (on this process's first status write) and then kept in memory for its whole
+    life -- so an externally-owned key present in that one-time read rides along in every payload
+    this process ever submits, stale, and wins the merge over a fresher on-disk value. See
+    ``_EXTERNALLY_OWNED_STATUS_KEYS``: those keys are stripped before a loaded snapshot ever becomes
+    part of ``payload``, so they never reach this function at all and the on-disk value here is
+    always the freshest one, from ``existing``, not a copy of what wins the ``{**existing,
+    **payload}`` merge.
+    """
     existing = _read_json_file(path)
     return {**existing, **payload} if isinstance(existing, dict) else payload
+
+
+# Runtime-status fields the gateway process must never persist from its own in-memory snapshot,
+# because they are owned exclusively by writers OUTSIDE this process's lifetime:
+#   - "desired_state": the operator's durable start/stop intent, written by the `hermes gateway`/
+#     `hermes profile` CLI (S6ServiceManager._write_gateway_desired_state) and by container_boot.py's
+#     boot reconciliation. It can change at ANY point during this process's life (an operator's
+#     `hermes gateway stop` runs in a separate process), so the value this process read at its own
+#     boot is not "this process's opinion" -- it is a snapshot from before the change.
+#
+# Without this, `_prepare_runtime_status_update` loads the on-disk record ONCE per process (into the
+# module-level `_runtime_status_state`) and keeps deep-copying it into every later payload. A
+# `desired_state` present in that one-time read then rides along, stale, until this process exits --
+# at which point its terminal status write (gateway_state="stopped"/"running") merges that STALE
+# in-memory value back over whatever is freshest on disk, clobbering an operator's stop that happened
+# in between (HERM-131: `hermes gateway stop` wrote `desired_state: stopped` while the gateway was
+# still up; the exiting gateway then wrote `desired_state: running` right back, so a pod recreate
+# resurrected messaging the operator had turned off).
+_EXTERNALLY_OWNED_STATUS_KEYS = frozenset({"desired_state"})
 
 
 _runtime_status_writer: Optional[_RuntimeStatusWriter] = None
@@ -1070,8 +1101,15 @@ def _prepare_runtime_status_update(
     with _runtime_status_state_lock:
         if reload_existing or _runtime_status_state_path != path or _runtime_status_state is None:
             _runtime_status_state_path = path
-            _runtime_status_state = (
-                (_read_json_file(path) if load_existing else None) or _build_runtime_status_record())
+            loaded = (_read_json_file(path) if load_existing else None) or _build_runtime_status_record()
+            # Never let an externally-owned field (see _EXTERNALLY_OWNED_STATUS_KEYS) enter the
+            # snapshot this process keeps and re-submits on every write: it would otherwise ride
+            # along, stale, for the rest of this process's life and clobber a fresher on-disk value
+            # written by another process (e.g. `hermes gateway stop`) the next time THIS process
+            # persists any status at all -- including its own terminal shutdown write.
+            for _key in _EXTERNALLY_OWNED_STATUS_KEYS:
+                loaded.pop(_key, None)
+            _runtime_status_state = loaded
         # The module snapshot is only ever reassigned (never mutated in place) and
         # submit() copies again, so the previous snapshot can be handed out as-is.
         previous_payload = _runtime_status_state

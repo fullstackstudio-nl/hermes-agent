@@ -331,3 +331,92 @@ def test_a_stopped_fleet_still_boots_nothing(tmp_path: Path) -> None:
 
     assert [a.action for a in actions] == ["registered"] * 3
     assert not any(a.folded_into_root for a in actions)
+
+
+# ---------------------------------------------------------------------------
+# HERM-131: HERMES_MESSAGING_GATEWAY=off
+# ---------------------------------------------------------------------------
+
+
+def test_messaging_gateway_off_registers_default_down_despite_running_desired_state(
+    tmp_path: Path,
+) -> None:
+    """The env switch overrides the START decision, not the recorded desire: a gateway whose
+    operator wants it running stays down while the container is configured with the gateway off."""
+    hermes_home = tmp_path / "data"
+    hermes_home.mkdir()
+    _seed_default_root(hermes_home, state="running")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=hermes_home, scandir=tmp_path / "svc", dry_run=True, container_argv=(),
+        messaging_gateway_enabled=False)
+
+    by_profile = {a.profile: a for a in actions}
+    assert by_profile["default"].action == "registered"
+    assert by_profile["default"].prior_state == "running"
+
+
+def test_messaging_gateway_off_does_not_touch_the_stored_desired_state(tmp_path: Path) -> None:
+    """The switch must be reversible without losing the operator's intent: unsetting
+    HERMES_MESSAGING_GATEWAY later has to bring back exactly what was running before it was set."""
+    hermes_home = tmp_path / "data"
+    hermes_home.mkdir()
+    _seed_default_root(hermes_home, state="running")
+    state_path = hermes_home / "gateway_state.json"
+    before = json.loads(state_path.read_text())
+
+    reconcile_profile_gateways(
+        hermes_home=hermes_home, scandir=tmp_path / "svc", dry_run=False, container_argv=(),
+        messaging_gateway_enabled=False)
+
+    assert json.loads(state_path.read_text()) == before
+
+    # Flip the switch back on: the same recorded desire now starts the gateway again.
+    actions = reconcile_profile_gateways(
+        hermes_home=hermes_home, scandir=tmp_path / "svc", dry_run=True, container_argv=(),
+        messaging_gateway_enabled=True)
+    assert next(a for a in actions if a.profile == "default").action == "started"
+
+
+def test_messaging_gateway_off_also_keeps_named_profile_slots_down(tmp_path: Path) -> None:
+    """Named slots are already never auto-started (one gateway per container); the switch must not
+    change that into starting them as a fallback."""
+    hermes_home = tmp_path / "data"
+    hermes_home.mkdir()
+    _seed_default_root(hermes_home, state="running")
+    _make_profile(hermes_home, "coder", state=None, desired_state="running")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=hermes_home, scandir=tmp_path / "svc", dry_run=True, container_argv=(),
+        messaging_gateway_enabled=False)
+
+    assert [a.action for a in actions] == ["registered", "registered"]
+
+
+def test_messaging_gateway_on_is_the_default_and_unaffected(tmp_path: Path) -> None:
+    """Omitting the parameter (the CLI's own call site) reads the live environment; unset (the
+    pre-existing behaviour) must not change anything for an operator who never heard of the switch."""
+    hermes_home = tmp_path / "data"
+    hermes_home.mkdir()
+    _seed_default_root(hermes_home, state="running")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=hermes_home, scandir=tmp_path / "svc", dry_run=True, container_argv=())
+
+    assert next(a for a in actions if a.profile == "default").action == "started"
+
+
+def test_messaging_gateway_enabled_reads_live_environment_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No explicit ``messaging_gateway_enabled=`` argument: the function reads
+    HERMES_MESSAGING_GATEWAY itself, the same way it will be called from cont-init.d."""
+    monkeypatch.setenv("HERMES_MESSAGING_GATEWAY", "off")
+    hermes_home = tmp_path / "data"
+    hermes_home.mkdir()
+    _seed_default_root(hermes_home, state="running")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=hermes_home, scandir=tmp_path / "svc", dry_run=True, container_argv=())
+
+    assert next(a for a in actions if a.profile == "default").action == "registered"

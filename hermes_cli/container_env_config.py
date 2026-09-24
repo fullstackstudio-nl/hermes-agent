@@ -69,6 +69,11 @@ DASHBOARD_PORT = "HERMES_DASHBOARD_PORT"
 TRUSTED_PROXIES = "HERMES_DASHBOARD_TRUSTED_PROXIES"
 PROFILES_MAX = "HERMES_PROFILES_MAX"
 HERMIE_PLUGIN = "HERMIE_PLUGIN"
+# HERM-131: keep the messaging gateway (and its cron scheduler) off for this container regardless of
+# any `desired_state` recorded on the volume. Consumed live — by hermes_cli.container_boot at every
+# boot and by `hermes gateway start` — not written into config.yaml: it is a container-level switch,
+# the same kind of setting as HERMES_DASHBOARD_HOST/_PORT below, not a per-profile operator intent.
+MESSAGING_GATEWAY = "HERMES_MESSAGING_GATEWAY"
 
 # Every variable this step owns. When one is set in the container environment, a same-named line in
 # $HERMES_HOME/.env is removed at start: Hermes loads that file with override semantics, so a copy
@@ -76,7 +81,7 @@ HERMIE_PLUGIN = "HERMIE_PLUGIN"
 MANAGED_ENV_NAMES = (
     PUBLIC_URL, PUBLIC_URLS, WRITE_ORIGIN_CHECK, BASIC_USERNAME, BASIC_PASSWORD, BASIC_PASSWORD_HASH, BASIC_SECRET,
     OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_SCOPES, DASHBOARD_HOST, DASHBOARD_PORT,
-    TRUSTED_PROXIES, PROFILES_MAX, HERMIE_PLUGIN,
+    TRUSTED_PROXIES, PROFILES_MAX, HERMIE_PLUGIN, MESSAGING_GATEWAY,
 )
 
 HERMIE_PLUGIN_REPO = "https://github.com/fullstackstudio-org/hermie-plugin.git"
@@ -134,6 +139,9 @@ class Plan:
     hermie_ref: Optional[str] = None
     # True when HERMIE_PLUGIN=true was explicit: an image without a baked plugin is then an error.
     hermie_required: bool = False
+    # HERMES_MESSAGING_GATEWAY: True unless explicitly set to an "off" value. Not written to
+    # config.yaml — see MESSAGING_GATEWAY above.
+    messaging_gateway_enabled: bool = True
     # Value-free remarks for the log.
     notes: list[str] = field(default_factory=list)
 
@@ -262,6 +270,31 @@ def _validate_git_ref(name: str, raw: str) -> str:
         raise ValueError(
             f"{name} must be a full 40-character commit SHA or a branch/tag name; the value is not a valid git ref")
     return raw
+
+
+def _validate_messaging_gateway(raw: str) -> bool:
+    """``HERMES_MESSAGING_GATEWAY``: on/off (also 1/0, true/false, yes/no), any casing."""
+    lowered = raw.strip().lower()
+    if lowered in _TRUTHY:
+        return True
+    if lowered in _FALSY:
+        return False
+    raise ValueError(f"{MESSAGING_GATEWAY} must be on or off (also accepts 1/0, true/false, yes/no)")
+
+
+def messaging_gateway_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether this container's messaging gateway (and its per-profile gateways) may run at all.
+
+    Read live by ``hermes_cli.container_boot`` at every boot and by ``hermes gateway start`` — this
+    is a container-level switch, not persisted operator intent, so there is nothing to reload from
+    disk. Degrades to enabled (the pre-existing behaviour) on a missing or unrecognized value: an
+    invalid value already fails the container closed in ``018-env-config`` (:func:`parse_environment`
+    raises), so a live read here should only ever see a validated value or nothing.
+    """
+    raw = _env(environ if environ is not None else os.environ, MESSAGING_GATEWAY)
+    if not raw:
+        return True
+    return raw.strip().lower() not in _FALSY
 
 
 def _parse_hermie(raw: str) -> tuple[str, Optional[str], bool]:
@@ -405,6 +438,18 @@ def parse_environment(environ: Mapping[str, str]) -> Plan:
     parsed = check(lambda: _parse_hermie(raw))
     if parsed is not None:
         plan.hermie_mode, plan.hermie_ref, plan.hermie_required = parsed
+
+    # -- HERM-131: the messaging-gateway kill switch. Not a config.yaml key (see MESSAGING_GATEWAY);
+    # validated here so a bad value fails the container closed at start, same as every other variable.
+    raw = _env(environ, MESSAGING_GATEWAY)
+    if raw:
+        value = check(lambda: _validate_messaging_gateway(raw))
+        if value is not None:
+            plan.messaging_gateway_enabled = value
+            if not value:
+                plan.notes.append(
+                    f"{MESSAGING_GATEWAY}=off: the messaging gateway and cron scheduler will not "
+                    "start in this container (the dashboard is unaffected)")
 
     if problems:
         raise EnvConfigError("\n".join(f"  - {p}" for p in problems))

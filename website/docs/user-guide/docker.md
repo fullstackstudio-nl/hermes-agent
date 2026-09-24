@@ -391,6 +391,7 @@ profile's config. The dashboard and `profiles.max` read their settings from that
 | `HERMIE_PLUGIN` | The Hermie companion plugin; see [below](#the-hermie-plugin). |
 | `HERMES_DASHBOARD` | `1` starts the supervised dashboard (see [Running the dashboard](#running-the-dashboard)). |
 | `HERMES_DASHBOARD_HOST` / `HERMES_DASHBOARD_PORT` | Where the dashboard binds. Defaults: `0.0.0.0` and `9119`. Validated at start. |
+| `HERMES_MESSAGING_GATEWAY` | `on` (default) or `off`. `off` keeps the messaging gateway — and its per-profile gateways — from starting in this container; see [Turning the messaging gateway off](#turning-the-messaging-gateway-off) below. Not written to `config.yaml`: it is a live, container-level switch, re-read on every boot. |
 
 The dashboard-auth variables have the same names the dashboard's auth plugins already read, so
 they mean the same thing inside and outside a container.
@@ -447,6 +448,46 @@ non-loopback bind with no provider configured. A `dashboard.public_url` with a n
 engages the gate even on a loopback bind. To keep the dashboard private to the pod (for example
 behind an authenticating sidecar), set `HERMES_DASHBOARD_HOST=127.0.0.1`. Basic auth is meant for
 trusted networks and VPNs. On the open internet, put the dashboard behind OIDC or Nous OAuth.
+
+### Turning the messaging gateway off
+
+`HERMES_MESSAGING_GATEWAY=off` keeps this container's messaging gateway — and every per-profile
+gateway — from starting, regardless of what was running before. This is the container-level switch
+for a tenant you want kept fully off (billing paused, offboarding, an incident); it is validated
+the same way as every other variable in the table above and fails the container closed on a value
+that is not `on`/`off` (also `1`/`0`, `true`/`false`, `yes`/`no`).
+
+What turning it off costs:
+
+- **No messaging platforms.** Telegram, Discord, Slack, WhatsApp and every other configured
+  platform adapter stay disconnected — nothing connects, nothing is delivered.
+- **No cron scheduler.** Scheduled jobs do not fire while the gateway is off; they resume on their
+  normal schedule once it is back on. Nothing is silently skipped or lost — jobs simply do not run
+  during the window the switch was off.
+- **The dashboard keeps working.** It is a separate supervised service and does not depend on the
+  gateway; port 9119 stays reachable, and you can still browse sessions, logs and settings.
+- **`hermes gateway start` explains itself instead of starting anything.** Run from inside the
+  container (`docker exec … hermes gateway start`), it prints that the messaging gateway is off by
+  configuration and exits non-zero, rather than silently doing nothing or fighting the switch on
+  the next restart.
+
+Unlike the other variables in this section, `HERMES_MESSAGING_GATEWAY` is **not** written to
+`config.yaml` — it is read live, at every container boot and by `hermes gateway start`, so
+unsetting it (or setting it back to `on`) and restarting the container brings the gateway back
+exactly as it was: whatever was durably recorded as running before the switch was flipped off
+starts again, and whatever was stopped stays stopped. That durability is the other half of this
+fix (HERM-131): a deliberate `hermes gateway stop` now survives a pod recreate on its own, even
+without the environment switch — see the following note.
+
+:::note `hermes gateway stop` now survives a container/pod recreate
+Stopping the gateway with `hermes gateway stop` records that intent durably (`desired_state:
+stopped` next to the gateway's other runtime state, on the persistent volume). A pod recreate, a
+`docker restart`, or the gateway crashing no longer bring a deliberately-stopped gateway back:
+only another explicit `hermes gateway start` (or unsetting `HERMES_MESSAGING_GATEWAY`, if that is
+what is holding it off) does. Before this fix, the gateway's own shutdown path could overwrite that
+recorded intent back to "running" while exiting, so a customer who had turned messaging off could
+see it come back on its own after infrastructure churn.
+:::
 
 ### The Hermie plugin
 

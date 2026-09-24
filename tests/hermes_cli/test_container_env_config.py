@@ -894,6 +894,58 @@ def test_write_origin_check_invalid(home):
         _run(home, {cec.WRITE_ORIGIN_CHECK: "sometimes"})
 
 
+class TestMessagingGatewaySwitch:
+    """HERM-131: HERMES_MESSAGING_GATEWAY is validated here but never written to config.yaml — it is
+    a live container switch read by hermes_cli.container_boot and `hermes gateway start`."""
+
+    def test_default_is_enabled(self):
+        assert cec.parse_environment({}).messaging_gateway_enabled is True
+
+    @pytest.mark.parametrize("raw", ["on", "ON", "1", "true", "True", "yes"])
+    def test_truthy_values_enable(self, raw):
+        assert cec.parse_environment({cec.MESSAGING_GATEWAY: raw}).messaging_gateway_enabled is True
+
+    @pytest.mark.parametrize("raw", ["off", "OFF", "0", "false", "False", "no"])
+    def test_falsy_values_disable(self, raw):
+        assert cec.parse_environment({cec.MESSAGING_GATEWAY: raw}).messaging_gateway_enabled is False
+
+    def test_invalid_value_fails_closed(self, home):
+        with pytest.raises(cec.EnvConfigError, match=cec.MESSAGING_GATEWAY):
+            _run(home, {cec.MESSAGING_GATEWAY: "sometimes", cec.PROFILES_MAX: "3"})
+        # Nothing else from the same (otherwise valid) environment was applied either.
+        assert not (home / "config.yaml").exists()
+
+    def test_off_does_not_touch_config_yaml(self, home):
+        # A fresh home has no config.yaml at all; HERMES_MESSAGING_GATEWAY alone must not create one.
+        changed = _run(home, {cec.MESSAGING_GATEWAY: "off"})
+        assert changed == []
+        assert not (home / "config.yaml").exists()
+
+    def test_off_alongside_a_real_setting_leaves_no_gateway_key_in_config(self, home):
+        _run(home, {cec.MESSAGING_GATEWAY: "off", cec.PROFILES_MAX: "3"})
+        cfg = _cfg(home)
+        assert cfg == {"profiles": {"max": 3}}
+
+    def test_messaging_gateway_enabled_helper_default(self, monkeypatch):
+        monkeypatch.delenv(cec.MESSAGING_GATEWAY, raising=False)
+        assert cec.messaging_gateway_enabled() is True
+
+    def test_messaging_gateway_enabled_helper_reads_live_environ(self, monkeypatch):
+        monkeypatch.setenv(cec.MESSAGING_GATEWAY, "off")
+        assert cec.messaging_gateway_enabled() is False
+        monkeypatch.setenv(cec.MESSAGING_GATEWAY, "on")
+        assert cec.messaging_gateway_enabled() is True
+
+    def test_messaging_gateway_enabled_helper_takes_explicit_mapping(self):
+        assert cec.messaging_gateway_enabled({cec.MESSAGING_GATEWAY: "off"}) is False
+        assert cec.messaging_gateway_enabled({}) is True
+
+    def test_messaging_gateway_is_a_managed_env_name(self):
+        # Consistency with the other container-level switches (e.g. HERMES_DASHBOARD_HOST): a copy
+        # left in $HERMES_HOME/.env must not shadow the container environment.
+        assert cec.MESSAGING_GATEWAY in cec.MANAGED_ENV_NAMES
+
+
 def test_env_file_copies_of_managed_variables_are_removed(home, capsys):
     env_file = home / ".env"
     env_file.write_text("OPENROUTER_API_KEY=sk-keep\n"

@@ -86,7 +86,8 @@ def _named_profile_dirs(hermes_home: Path) -> list[tuple[str, Path]]:
 
 def reconcile_profile_gateways(
     *, hermes_home: Path, scandir: Path, dry_run: bool = False,
-    container_argv: Sequence[str] | None = None) -> list[ReconcileAction]:
+    container_argv: Sequence[str] | None = None,
+    messaging_gateway_enabled: bool | None = None) -> list[ReconcileAction]:
     """Recreate s6 service registrations for every persistent profile.
 
     Always registers a ``gateway-default`` slot for the root profile (the implicit profile at
@@ -96,7 +97,18 @@ def reconcile_profile_gateways(
     Without it, bare ``hermes gateway start`` inside the container would land on ``s6-svc -u
     /run/service/gateway-default`` → uncaught ``CalledProcessError`` → traceback to the user (PR #30136
     review).
+
+    ``messaging_gateway_enabled`` (default: read live from ``HERMES_MESSAGING_GATEWAY``, HERM-131)
+    is the container-level kill switch: when False every slot is registered but none is started,
+    REGARDLESS of what ``desired_state`` says. It answers a different question than
+    ``desired_state`` does — "may a gateway run in this container at all" rather than "did the
+    operator ask this one to run" — so it overrides the start decision without touching the
+    persisted desire: unsetting the variable later must bring back exactly the gateway(s) that were
+    running before it was set, not the ones that happened to be running while it was off.
     """
+    if messaging_gateway_enabled is None:
+        from hermes_cli.container_env_config import messaging_gateway_enabled as _read_messaging_gateway_enabled
+        messaging_gateway_enabled = _read_messaging_gateway_enabled()
     actions: list[ReconcileAction] = []
     # ONE gateway per container: named slots are registered (so `hermes -p X gateway start` has a
     # target and `s6-svstat` can report them) but are NEVER booted from their persisted run intent.
@@ -122,6 +134,12 @@ def reconcile_profile_gateways(
     folded, default_should_start = list(fold.folded), fold.root_should_start
     if folded and default_prior_state not in _AUTOSTART_STATES:
         log.warning("%s", boot_notice(folded))
+    if default_should_start and not messaging_gateway_enabled:
+        log.warning(
+            "HERMES_MESSAGING_GATEWAY=off: not starting gateway-default even though its recorded "
+            "desired_state asked for it; the recorded desire is left untouched and takes effect "
+            "again once the variable is unset or set back to on")
+        default_should_start = False
     if not dry_run:
         _cleanup_stale_runtime_files(hermes_home)
         _register_service(scandir, "default", start=default_should_start)
@@ -355,9 +373,16 @@ def main() -> int:
         print("reconcile: skipping (dashboard container — does not need per-profile gateways)")
         return 0
 
+    from hermes_cli.container_env_config import MESSAGING_GATEWAY, messaging_gateway_enabled
+    gateway_enabled = messaging_gateway_enabled()
+    if not gateway_enabled:
+        print(f"reconcile: {MESSAGING_GATEWAY}=off — every gateway slot is registered but none is "
+              "started; the dashboard is unaffected")
+
     hermes_home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
     scandir = Path(os.environ.get("S6_PROFILE_GATEWAY_SCANDIR", "/run/service"))
-    actions = reconcile_profile_gateways(hermes_home=hermes_home, scandir=scandir)
+    actions = reconcile_profile_gateways(
+        hermes_home=hermes_home, scandir=scandir, messaging_gateway_enabled=gateway_enabled)
     folded = [a.profile for a in actions if a.profile != "default" and a.folded_into_root]
     if folded:
         print(boot_notice(folded))

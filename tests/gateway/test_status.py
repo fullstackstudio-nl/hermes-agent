@@ -317,6 +317,38 @@ class TestGatewayRuntimeStatus:
         assert payload["pid"] == os.getpid(), "PID should be overwritten, not preserved via setdefault"
         assert payload["start_time"] != 1000.0, "start_time should be overwritten on restart"
 
+    def test_write_runtime_status_never_clobbers_desired_state_set_out_of_process(self, tmp_path, monkeypatch):
+        """Regression (HERM-131): ``hermes gateway stop`` (S6ServiceManager, a SEPARATE process)
+        stamps ``desired_state: stopped`` onto ``gateway_state.json`` directly, then SIGTERMs the
+        gateway. The gateway's FIRST status write in its life (at boot) reads that file into the
+        in-process ``_runtime_status_state`` cache -- including whatever ``desired_state`` was on
+        disk at that moment. If the operator's stop lands later, while the gateway is still up, the
+        gateway's own terminal-status write at shutdown must not resurrect the stale in-memory
+        ``desired_state`` it cached at boot and clobber the operator's stop back to ``running``:
+        that is exactly how a stopped messaging gateway came back after a pod recreate."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        state_path = tmp_path / "gateway_state.json"
+
+        # Gateway boots while the operator's last recorded intent is "running".
+        state_path.write_text(json.dumps({"desired_state": "running", "gateway_state": "starting"}))
+        status.write_runtime_status(gateway_state="running")
+        assert status.read_runtime_status()["desired_state"] == "running"
+
+        # `hermes gateway stop`, a DIFFERENT process, stamps the operator's stop directly onto disk
+        # (S6ServiceManager._write_gateway_desired_state) while this gateway is still alive.
+        on_disk = json.loads(state_path.read_text())
+        on_disk["desired_state"] = "stopped"
+        state_path.write_text(json.dumps(on_disk))
+
+        # The gateway's own shutdown path persists its terminal gateway_state.
+        status.write_runtime_status(gateway_state="stopped")
+
+        payload = status.read_runtime_status()
+        assert payload["gateway_state"] == "stopped"
+        assert payload["desired_state"] == "stopped", (
+            "the gateway's own status write overwrote the operator's stop back to 'running'"
+        )
+
 
     def test_runtime_status_running_pid_rejects_pid_reused_by_other_profile(self, monkeypatch):
         """Regression (user report): a stale profile's recycled PID must not be

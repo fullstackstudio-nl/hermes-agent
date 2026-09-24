@@ -4340,6 +4340,23 @@ def _service_call(backend: str, verb: str, system: bool | None = False) -> None:
 # Main Command Handler
 # =============================================================================
 
+def _refuse_start_if_messaging_gateway_disabled() -> None:
+    """HERM-131: explain — and refuse — a start when this container's ``HERMES_MESSAGING_GATEWAY``
+    is off, instead of silently un-downing an s6 slot that ``02-reconcile-profiles`` deliberately
+    left down at boot. Covers both ``hermes gateway start`` and the ``gateway run`` → supervised
+    longrun redirect (:func:`_maybe_redirect_run_to_s6_supervision`), which both funnel through
+    :func:`_dispatch_via_service_manager_if_s6`."""
+    from hermes_cli.container_env_config import MESSAGING_GATEWAY, messaging_gateway_enabled
+
+    if messaging_gateway_enabled():
+        return
+    print_error(f"This container keeps the messaging gateway off ({MESSAGING_GATEWAY}=off).")
+    print("  Messaging platforms and the cron scheduler will not start.")
+    print(f"  Set {MESSAGING_GATEWAY}=on (or unset it) for this container, then restart the "
+          "container to allow the gateway to run.")
+    sys.exit(1)
+
+
 def _dispatch_via_service_manager_if_s6(action: str, profile: str | None = None) -> bool:
     """Dispatch start/stop/restart via s6 inside an s6 container; True iff dispatched (caller returns).
     Profile defaults to the current one; missing slot / s6 errors become actionable CLI messages."""
@@ -4355,6 +4372,8 @@ def _dispatch_via_service_manager_if_s6(action: str, profile: str | None = None)
     mgr = get_service_manager()
     if action not in ("start", "stop", "restart"):
         return False
+    if action == "start":
+        _refuse_start_if_messaging_gateway_disabled()
     service = f"gateway-{profile}"
     try:
         try:
