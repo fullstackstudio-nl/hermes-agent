@@ -966,8 +966,13 @@ dashboard:
 
 When set, the OAuth callback URL becomes `<public_url>/auth/callback` verbatim — `X-Forwarded-Prefix` is ignored on that code path because the operator has explicitly declared the public URL. This is intentional: stacking the prefix on top would double-prefix the common case where the prefix is already baked into `public_url`.
 
-The hostname in `public_url` is also accepted as an **exact** HTTP `Host` and
-WebSocket `Origin` value. This supports a reverse proxy that preserves the
+The hostname in `public_url` is also accepted as an **exact** HTTP `Host`
+value (on any port: proxies rewrite it), and a WebSocket `Origin` naming that
+hostname must match `public_url` exactly — scheme, host and port — or be the
+request's own `host:port`. A `public_url` written as `http://` for a dashboard
+the browser opens over `https://` therefore has its WebSocket refused (this
+fork logs that, naming the Origin and what is listed): write the scheme the
+browser uses. This supports a reverse proxy that preserves the
 browser-facing hostname while forwarding to a dashboard bound to
 `127.0.0.1`. Wildcards and suffix matches are not allowed, so an attacker host
 such as `dashboard.example.com.evil.test` remains rejected by the DNS-rebinding
@@ -1009,6 +1014,70 @@ proxying to the loopback dashboard. Use that exact HTTPS origin as
 `dashboard.public_url`. It is still treated as a non-loopback browser-facing
 origin and therefore requires a dashboard auth provider; this does not require
 making the service reachable from the public internet.
+
+### Several public origins (this fork)
+
+`fullstackstudio-nl/hermes-agent` also reads `dashboard.public_urls`, a list of
+further origins the same dashboard is served on — for example Hermie Web on its
+own domain next to the gateway's:
+
+```yaml
+dashboard:
+  public_url: "https://hermes.example.com"   # primary
+  public_urls:
+    - "https://app.example.com"
+  trusted_proxies:
+    - "172.20.0.5"
+  write_origin_check: auto                   # auto | on | off
+```
+
+- **Primary.** `public_url` (or `HERMES_DASHBOARD_PUBLIC_URL`) stays the primary
+  origin; without it, the first `public_urls` entry is. Anything that needs one
+  URL uses the primary. A gateway with only `public_url` behaves as upstream
+  does, except that a WebSocket `Origin` must match it exactly (see above).
+- **Host guard.** Every listed hostname is accepted, on any port, exactly as
+  for a single `public_url`.
+- **WebSocket `Origin`.** One naming a listed hostname must match a listed
+  origin exactly — scheme, host and port — or be the request's own
+  `host:port`. A refusal closes the socket with a reason naming the Origin and
+  the listed origins, and is logged once per Origin.
+- **Sign-in stays on the origin it started on.** The OIDC `redirect_uri` is
+  `<listed URL>/auth/callback` for the origin the request came in on, and the
+  primary's for anything else. It is always a listed URL, never text from the
+  request, so an unlisted `Host` cannot become a redirect target. A `Host`
+  without a port matches the one listed origin with that scheme and host when
+  there is exactly one. Because the callback lands on the same host, the PKCE
+  cookie and the session cookie stay there, and the post-login redirect (a
+  same-origin path) returns to it.
+- **Read at startup.** The origin list is read once when the dashboard starts
+  and serves both the guards and the `redirect_uri`, so a sign-in is never
+  handed a callback the guards would refuse. Restart after changing it.
+- **Behind a proxy**, the request's origin is `X-Forwarded-Host` +
+  `X-Forwarded-Proto`, but only when the connecting peer is loopback or in
+  `trusted_proxies` — the same peers whose `X-Forwarded-Proto` is honoured —
+  and only when that names a listed origin. Otherwise the `Host` header counts.
+  The proxy must **overwrite** `X-Forwarded-Host` with the host the browser
+  asked for rather than append to one the client sent (only the first value is
+  read; a client can then still only pick among listed origins). A TLS
+  terminator that is not trusted makes every request look like `http`, so an
+  `https` origin never matches and its sign-in falls back to the primary
+  callback; the gateway logs a warning saying so.
+- **One session per origin.** Cookies stay host-only (no `Domain`, `__Host-`
+  over HTTPS), so signing in on one origin does not sign you in on another.
+- **Register every callback.** The OIDC client must list
+  `<each URL>/auth/callback` as a redirect URI; the gateway logs the full list
+  at startup. An IdP that refuses an unregistered redirect URI usually shows
+  its own error page; when it reports the refusal back instead, the gateway's
+  error names the `redirect_uri` it sent.
+- **Write requests check `Origin`** (`dashboard.write_origin_check`). With
+  `auto`, the default, this is on when two or more origins are listed and off
+  for a single `public_url`; `on` and `off` force it. When on, a
+  cookie-authenticated `POST`/`PUT`/`PATCH`/`DELETE` whose browser `Origin` is
+  neither a listed origin nor the request's own host gets 403; the body names
+  the refused Origin and the setting to change, and each refused Origin is
+  logged once. `SameSite=Lax` alone does not cover this, because every
+  `*.example.com` is the same site. Requests without an `Origin`, with a non-web
+  origin (packaged desktop) or with a bearer token are not affected.
 
 Same precedence as the other dashboard settings — env wins over `config.yaml`:
 

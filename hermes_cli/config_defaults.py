@@ -1046,6 +1046,15 @@ DEFAULT_CONFIG = {
         # the OAuth path. Empty or malformed (no http(s):// + host, or quote/angle/whitespace chars)
         # = reconstruct from headers.
         "public_url": "",
+        # Fork: further public origins (list of full URLs), e.g. Hermie Web on its own domain. Their
+        # hostnames pass the Host guard, a WS Origin must match one exactly (scheme + host + port),
+        # and an OIDC sign-in started on one gets its callback on that same origin -- so the IdP
+        # client must register every <url>/auth/callback. public_url (when set) stays the primary;
+        # else the first entry. Read once at startup.
+        "public_urls": [],
+        # Fork: refuse cookie-authenticated writes whose browser Origin is neither listed nor the
+        # request's own. auto = on with 2+ public origins (off for a single public_url); on | off.
+        "write_origin_check": "auto",
     },
 
     "privacy": {

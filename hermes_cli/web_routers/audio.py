@@ -19,7 +19,7 @@ import urllib.request
 from fastapi import APIRouter
 from hermes_cli.web_routers._common import http_failure
 from hermes_cli.web_deps import late
-from hermes_cli.web_server_chat import _ws_auth_ok, _ws_request_is_allowed
+from hermes_cli.web_server_chat import _ws_auth_ok, _ws_refusal_close_reason
 from hermes_cli.web_server_gateway import _split_text_for_speak_stream
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 from hermes_cli.web_models import AudioTranscriptionRequest, TTSSpeakRequest, TTSLeaseRequest, VoiceLiveSessionRequest
@@ -398,8 +398,9 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
     if not _ws_auth_ok(ws):
         await ws.close(code=4401)
         return
-    if not _ws_request_is_allowed(ws):
-        await ws.close(code=4403)
+    refusal = _ws_refusal_close_reason(ws)
+    if refusal is not None:
+        await ws.close(code=4403, reason=refusal)
         return
     await ws.accept()
 

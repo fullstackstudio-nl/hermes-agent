@@ -13,7 +13,6 @@ from collections import deque
 import hmac
 import logging
 import os
-import re
 import secrets
 import subprocess
 import sys
@@ -60,6 +59,10 @@ WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.enviro
 _log = logging.getLogger(__name__)
 
 
+from hermes_cli.dashboard_auth.origins import (  # noqa: E402
+    callback_urls, describe_origins, install_forwarded_peer_marker, resolve_public_origins,
+    split_authority, write_origin_check_enabled)
+from hermes_cli.web_server_origin_guard import _cross_origin_write_refusal  # noqa: E402
 from hermes_cli.web_server_lifecycle import (  # noqa: E402
     PORT_IN_USE_EXIT_CODE,
     _dashboard_forwarded_allow_ips,
@@ -452,19 +455,13 @@ _LOOPBACK_HOST_VALUES: frozenset = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 def _dashboard_public_hosts() -> frozenset[str]:
-    """Return the exact hostname declared by ``dashboard.public_url``.
+    """Return the exact hostnames of every listed public origin (``dashboard.public_url`` plus
+    the fork's ``dashboard.public_urls``).
 
     One source of truth for OAuth redirects, Host and WS Origin validation.
     Malformed or unset values fail closed as an empty set.
     """
-    from hermes_cli.dashboard_auth.prefix import resolve_public_url
-
-    public_url = resolve_public_url()
-    try:
-        hostname = urllib.parse.urlparse(public_url).hostname if public_url else None
-    except ValueError:
-        hostname = None
-    return frozenset({hostname.lower()}) if hostname else frozenset()
+    return frozenset(o.host for o in resolve_public_origins())
 
 
 def should_require_auth(host: str, allow_public: bool = False) -> bool:
@@ -513,40 +510,6 @@ def _desktop_loopback_auth_exempt(
     )
 
 
-def _host_header_hostname(host_header: str) -> str:
-    """Return a normalized hostname from a valid HTTP Host authority.
-
-    Host headers are authorities, not full URLs. Reject ambiguous ports,
-    malformed IPv6 brackets, and URL syntax so validation always fails closed.
-    """
-    value = (host_header or "").strip()
-    if not value or "://" in value or any(c in value for c in '"\'<> \n\r\t/?#@'):
-        return ""
-
-    if value.startswith("["):
-        close = value.find("]")
-        if close == -1:
-            return ""
-        hostname = value[1:close]
-        # Bracket notation is reserved for IPv6 literals.
-        if ":" not in hostname:
-            return ""
-        suffix = value[close + 1:]
-        if suffix and not re.fullmatch(r":\d+", suffix):
-            return ""
-        return hostname.lower()
-
-    # Unbracketed IPv6 authorities are ambiguous with a port separator.
-    if value.count(":") > 1:
-        return ""
-    if ":" in value:
-        hostname, port = value.rsplit(":", 1)
-        if not hostname or not port.isdigit():
-            return ""
-        return hostname.lower()
-    return value.lower()
-
-
 def _is_accepted_host(
     host_header: str,
     bound_host: str,
@@ -557,11 +520,12 @@ def _is_accepted_host(
     Accepts:
     - Exact bound host (with or without port suffix)
     - Loopback aliases when bound to loopback
-    - Exact operator-declared public hosts (with or without port suffix)
+    - Exact operator-declared public hosts, every listed public origin's (with or without
+      port suffix: proxies rewrite the port too freely for it to be checked here)
     - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
       no protection possible at this layer)
     """
-    host_only = _host_header_hostname(host_header)
+    host_only, _port = split_authority(host_header)
     if not host_only:
         return False
     # All-interfaces bind: no Host-layer defence is possible; rely on operator
@@ -591,6 +555,9 @@ async def host_header_middleware(request: Request, call_next):
                 ),
             },
         )
+    refusal = _cross_origin_write_refusal(request)
+    if refusal is not None:
+        return refusal
     return await call_next(request)
 
 
@@ -1105,7 +1072,14 @@ def _configure_auth_gate(
     # reverse-proxy deployments; resolved once so middleware never reloads
     # config. A non-loopback public hostname engages the gate even on a loopback
     # backend, else the SPA's local session token becomes remotely reachable.
-    app.state.trusted_public_hosts = _dashboard_public_hosts()
+    # One snapshot for the guards AND the redirect_uri (dashboard_auth.origins), so a sign-in is
+    # never handed a callback the guards would refuse; a config change needs a restart for both.
+    app.state.public_origins = origins = resolve_public_origins()
+    app.state.trusted_public_hosts = frozenset(o.host for o in origins)
+    app.state.write_origin_check = write_origin_check_enabled(origins)
+    if len(origins) > 1:
+        _log.info("Dashboard public origins: %s (primary first). An OIDC client must register "
+                  "each callback: %s", describe_origins(origins), ", ".join(callback_urls(origins)))
     # auth_required drives middleware, SPA-token injection, WS auth, the
     # startup refusal, the gate-on banner and uvicorn proxy_headers.
     if _desktop_loopback_auth_exempt(host, ssh_session_token, ssh_owner_nonce):
@@ -1202,6 +1176,8 @@ def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
         ws_ping_timeout=ping_timeout,
         ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
     )
+    # X-Forwarded-Host is honoured from the same peers as X-Forwarded-Proto (dashboard_auth.origins).
+    install_forwarded_peer_marker(config)
     return config, uvicorn.Server(config)
 
 

@@ -45,8 +45,8 @@ def test_hosted_auth_start_returns_public_authorization_url(monkeypatch):
 
     monkeypatch.setattr(_web_server_mcp, "_run_dashboard_mcp_oauth", fake_worker)
     with patch(
-        "hermes_cli.dashboard_auth.prefix.resolve_public_url",
-        return_value="https://agent.example",
+        "hermes_cli.dashboard_auth.prefix.resolve_public_urls",
+        return_value=["https://agent.example"],
     ):
         response = client.post("/api/mcp/servers/reports/auth")
 

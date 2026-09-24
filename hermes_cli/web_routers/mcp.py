@@ -68,10 +68,12 @@ def _mcp_oauth_callback_url(request: Request, server_name: str) -> str:
     """Externally reachable callback URL for a dashboard flow."""
     from urllib.parse import quote, urlparse, urlunparse
 
-    from hermes_cli.dashboard_auth.prefix import prefix_from_request, resolve_public_url
+    from hermes_cli.dashboard_auth.origins import public_base_url
+    from hermes_cli.dashboard_auth.prefix import prefix_from_request
 
     suffix = f"/api/mcp/oauth/callback/{quote(server_name, safe='')}"
-    public_url = resolve_public_url()
+    # The listed public origin this request came in on, else the primary (dashboard_auth.origins).
+    public_url = public_base_url(request)
     if public_url:
         return f"{public_url}{suffix}"
     base = urlparse(str(request.base_url))

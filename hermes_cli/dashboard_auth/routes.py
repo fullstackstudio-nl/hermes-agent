@@ -32,6 +32,7 @@ from starlette.concurrency import run_in_threadpool
 
 from hermes_cli.dashboard_auth import (
     get_provider, list_providers, list_session_providers, native_flow, pictures)
+from hermes_cli.dashboard_auth import origins as _origins
 from hermes_cli.dashboard_auth import prefix as _prefix_mod
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import (
@@ -69,10 +70,13 @@ def _audit(request: Request, event: AuditEvent, **fields) -> None:
 
 def _redirect_uri(request: Request) -> str:
     """Absolute ``/auth/callback`` URL handed to the IDP. An operator-declared public URL is the
-    complete authority (``X-Forwarded-Prefix`` ignored so a baked-in prefix is not doubled);
-    otherwise ``url_for`` (honours ``X-Forwarded-Host/Proto`` under uvicorn ``proxy_headers``)
-    with the prefix prepended, which Starlette does not do."""
-    public_url = _prefix_mod.resolve_public_url()
+    complete authority (``X-Forwarded-Prefix`` ignored so a baked-in prefix is not doubled):
+    the listed URL of the origin this request came in on, else the primary (fork: several
+    ``dashboard.public_urls``; see ``dashboard_auth.origins``), so the callback lands on the
+    host that holds the PKCE cookie. The value is always a listed URL, never the request's own
+    Host. Otherwise ``url_for`` (``X-Forwarded-Proto`` under uvicorn ``proxy_headers``) with
+    the prefix prepended, which Starlette does not do."""
+    public_url = _origins.public_base_url(request)
     if public_url:
         return f"{public_url}/auth/callback"
     base = str(request.url_for("auth_callback"))
@@ -81,6 +85,17 @@ def _redirect_uri(request: Request) -> str:
         return base
     parsed = urlparse(base)
     return urlunparse(parsed._replace(path=f"{prefix}{parsed.path}"))
+
+
+def _redirect_uri_hint(request: Request, *idp_text: str) -> str:
+    """When the IdP's own error text names the redirect URI, say which one this gateway sent and
+    that it must be registered. With several public origins each has its own callback; an IdP
+    that refuses one outright usually shows its own error page and never returns here."""
+    if "redirect" not in " ".join(idp_text).lower():
+        return ""
+    return (f" -- the gateway sent redirect_uri {_redirect_uri(request)}; register it with the "
+            "identity provider's client (every origin in dashboard.public_urls needs its own "
+            "/auth/callback).")
 
 
 def _provider_pkce_segments(cookie_payload: dict[str, str]) -> dict[str, str]:
@@ -314,7 +329,8 @@ async def auth_callback(
         raise _http(400, f"Unknown provider in cookie: {provider_name!r}")
     if error:
         _login_failure(request, provider_name, "idp_error", error=error)
-        raise _http(400, f"OAuth error from provider: {error} ({error_description})")
+        raise _http(400, f"OAuth error from provider: {error} ({error_description})"
+                         f"{_redirect_uri_hint(request, error, error_description)}")
     if not state or state != parts.get("state", ""):
         _login_failure(request, provider_name, "state_mismatch")
         raise _http(400, "OAuth state mismatch (CSRF check failed)")
@@ -324,7 +340,7 @@ async def auth_callback(
             redirect_uri=_redirect_uri(request))
     except InvalidCodeError as e:
         _login_failure(request, provider_name, "invalid_code")
-        raise _http(400, f"Invalid code: {e}")
+        raise _http(400, f"Invalid code: {e}{_redirect_uri_hint(request, str(e))}")
     except ProviderError as e:
         _login_failure(request, provider_name, "provider_unreachable")
         raise _http(503, f"Provider unreachable: {e}")

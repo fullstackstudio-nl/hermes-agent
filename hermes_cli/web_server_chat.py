@@ -167,26 +167,39 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
 
     HTTP middleware does not run for WebSocket routes, so the DNS-rebinding
     Host check is repeated here; an Origin header, when present, must target the
-    bound host.  Non-web origins (packaged Electron: file://, null, app://) are
-    trusted — the credential check is the real auth boundary there.
+    bound host or be one of the listed public origins exactly (scheme, host and
+    port; see ``dashboard_auth.origins``). Non-web origins (packaged Electron:
+    file://, null, app://) are trusted — the credential check is the real auth
+    boundary there.
     """
+    from hermes_cli.dashboard_auth.origins import describe_origins, warn_refused_origin
     from hermes_cli.web_server import _is_accepted_host, app
+    from hermes_cli.web_server_origin_guard import WS_ORIGIN_FIX, _is_accepted_origin
     bound_host = getattr(app.state, "bound_host", None)
     if not bound_host:
         return None
     trusted_public_hosts = getattr(app.state, "trusted_public_hosts", frozenset())
+    public_origins = getattr(app.state, "public_origins", ())
     host_header = ws.headers.get("host", "")
     if not _is_accepted_host(host_header, bound_host, trusted_public_hosts):
         return f"host_mismatch host={host_header or '?'} bound={bound_host}"
     origin = ws.headers.get("origin", "")
-    if not origin:
-        return None
-    parsed = urllib.parse.urlparse(origin)
-    if parsed.scheme not in {"http", "https"}:
-        return None
-    if not parsed.netloc or not _is_accepted_host(parsed.netloc, bound_host, trusted_public_hosts):
-        return f"origin_mismatch origin={origin} bound={bound_host}"
+    if not _is_accepted_origin(origin, bound_host, trusted_public_hosts, public_origins,
+                               host_header=host_header):
+        warn_refused_origin("WebSocket upgrade", origin, public_origins, WS_ORIGIN_FIX)
+        expected = describe_origins(public_origins) if public_origins else bound_host
+        return f"origin_mismatch origin={origin[:200]} expected={expected}"
     return None
+
+
+def _ws_refusal_close_reason(ws: "WebSocket") -> Optional[str]:
+    """Why the upgrade is refused (Host/Origin, then peer), clamped to RFC 6455's 123-byte close
+    reason; ``None`` when allowed. The full reason is logged by the guard."""
+    reason = _ws_host_origin_reason(ws) or _ws_client_reason(ws)
+    if reason is None:
+        return None
+    encoded = reason.encode("utf-8", "replace")
+    return reason if len(encoded) <= 123 else encoded[:120].decode("utf-8", "ignore") + "..."
 
 
 def _ws_host_origin_is_allowed(ws: "WebSocket") -> bool:

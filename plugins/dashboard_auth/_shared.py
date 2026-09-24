@@ -144,8 +144,12 @@ def exchange_token(
     except httpx.RequestError as exc:
         raise ProviderError(f"{endpoint} unreachable: {exc}") from exc
     if response.status_code == 400:
-        error_code = parse_json_body(response).get("error", "invalid_request")
-        raise bad_request_exc(f"{idp} rejected token request: {error_code}")
+        body = parse_json_body(response)
+        error_code = body.get("error", "invalid_request")
+        # The description is where an IdP says "redirect_uri mismatch"; bounded, never the body.
+        description = str(body.get("error_description") or "")[:200]
+        raise bad_request_exc(
+            f"{idp} rejected token request: {error_code}" + (f" ({description})" if description else ""))
     if response.status_code != 200:
         raise ProviderError(f"{endpoint} returned {response.status_code}: {response.text[:200]!r}")
     payload = parse_json_body(response)

@@ -2174,6 +2174,19 @@ updates:
 #   #
 #   #   public_url: "https://example.com/hermes"
 #   #
+#   # (This fork) Further public origins the same dashboard is served on, e.g.
+#   # Hermie Web on its own domain. Their hostnames pass the Host guard, a
+#   # WebSocket Origin must match one exactly (scheme + host + port), and an
+#   # OIDC sign-in started on one gets "<that URL>/auth/callback", so the OIDC
+#   # client must register every one. public_url stays the primary (else the
+#   # first entry is). Read at startup. write_origin_check refuses
+#   # cookie-authenticated writes from an unlisted browser Origin: auto (on
+#   # with 2+ origins), on or off.
+#   #
+#   #   public_urls:
+#   #     - "https://app.example.com"
+#   #   write_origin_check: auto
+#   #
 #   # Reverse proxies connecting from another container or host are not
 #   # trusted by default. Add only the proxy's exact IP address, or a bounded
 #   # CIDR for a dedicated proxy network, so X-Forwarded-Proto and

@@ -21,7 +21,7 @@ from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_routers.chat_ws_errors import chat_start_failure_message
 from hermes_cli.web_server_chat import (
     _build_sidecar_url, _close_stalled_pty_input, _get_console_executor, _legacy_pump, _ws_auth_ok,
-    _ws_request_is_allowed,
+    _ws_refusal_close_reason,
 )
 
 _log = logging.getLogger("hermes_cli.web_server")
@@ -145,8 +145,9 @@ async def _close_unless_sidecar_allowed(ws: WebSocket) -> bool:
     if not _ws_auth_ok(ws):
         await ws.close(code=4401)
         return False
-    if not _ws_request_is_allowed(ws):
-        await ws.close(code=4403)
+    refusal = _ws_refusal_close_reason(ws)
+    if refusal is not None:
+        await ws.close(code=4403, reason=refusal)
         return False
     return True
 
